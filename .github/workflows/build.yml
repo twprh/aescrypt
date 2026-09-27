@@ -36,14 +36,14 @@ jobs:
           pip install pyinstaller
 
       - name: Build with PyInstaller
-        run: |
-          pyinstaller \
-            --clean \
-            --noconfirm \
-            --onefile \
-            --windowed \
-            --collect-all tkinterdnd2 \
-            --name aescrypto \
+        run:
+          pyinstaller ^
+            --clean ^
+            --noconfirm ^
+            --onefile ^
+            --windowed ^
+            --collect-all tkinterdnd2 ^
+            --name aescrypto ^
             main.py
 
       - name: Rename Linux executable
@@ -81,13 +81,13 @@ jobs:
 
       - name: Build with PyInstaller
         run: 
-          pyinstaller \
-            --clean \
-            --noconfirm \
-            --onefile \
-            --windowed \
-            --collect-all tkinterdnd2 \
-            --name aescrypto \
+          pyinstaller ^
+            --clean ^
+            --noconfirm ^
+            --onefile ^
+            --windowed ^
+            --collect-all tkinterdnd2 ^
+            --name aescrypto ^
             main.py
 
       - name: Rename Windows executable
