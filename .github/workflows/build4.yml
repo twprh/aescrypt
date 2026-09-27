@@ -166,7 +166,7 @@ jobs:
 
           echo "Release version: $TAG"
 
-          if [[ "$TAG" != v* ]]; then
+          if [[ "$TAG" != v* && "$TAG" != V* ]]; then
             echo "ERROR: Release version must start with 'v'."
             echo "Example: v1.0.0"
             exit 1
