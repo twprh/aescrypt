@@ -2,6 +2,12 @@ name: Build Python application
 
 on:
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release-Version (z.B. v1.0.0). Leer lassen = kein Release."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -105,17 +111,6 @@ jobs:
 
   # ============================================================
   # GitHub Release
-  #
-  # Wird nur ausgeführt, wenn der Workflow manuell auf
-  # einem Tag gestartet wird, der mit "v" beginnt.
-  #
-  # Beispiele:
-  #   v1.0.0
-  #   v1.1.0
-  #   v2.0.0
-  #
-  # Wenn nur ein Build erfolgreich ist, wird auch nur dieses
-  # Programm veröffentlicht.
   # ============================================================
   release:
     name: Create GitHub Release
@@ -125,9 +120,15 @@ jobs:
       - build-linux
       - build-windows
 
+    # Release nur dann, wenn bei "Run workflow"
+    # eine Version eingegeben wurde.
+    #
+    # always() sorgt dafür, dass der Release-Job auch dann
+    # ausgeführt werden kann, wenn einer der beiden Builds
+    # fehlgeschlagen ist.
     if: |
       always() &&
-      startsWith(github.ref, 'refs/tags/v')
+      inputs.release_version != ''
 
     steps:
 
@@ -150,7 +151,6 @@ jobs:
 
       # ----------------------------------------------------------
       # Linux Artifact herunterladen
-      # Nur wenn Linux erfolgreich gebaut wurde
       # ----------------------------------------------------------
       - name: Download Linux artifact
         if: needs.build-linux.result == 'success'
@@ -162,9 +162,8 @@ jobs:
 
       # ----------------------------------------------------------
       # Windows Artifact herunterladen
-      # Nur wenn Windows erfolgreich gebaut wurde
       # ----------------------------------------------------------
-      - name: Download Windows artifact
+      - name: Download Windows Artifact
         if: needs.build-windows.result == 'success'
         uses: actions/download-artifact@v8
         with:
@@ -173,23 +172,32 @@ jobs:
 
 
       # ----------------------------------------------------------
-      # GitHub Release erstellen
+      # Release erstellen
       # ----------------------------------------------------------
-      - name: Create or update GitHub Release
+      - name: Create GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
 
-          TAG="${{ github.ref_name }}"
+          TAG="${{ inputs.release_version }}"
 
-          echo "Release tag: $TAG"
-          echo ""
-          echo "Available files:"
-          ls -lah release || true
+          echo "Release version: $TAG"
           echo ""
 
+          # ------------------------------------------------------
+          # Prüfen, ob Version mit "v" beginnt
+          # ------------------------------------------------------
+          if [[ "$TAG" != v* ]]; then
+            echo "ERROR: Release version must start with 'v'."
+            echo "Example: v1.0.0"
+            exit 1
+          fi
+
+          # ------------------------------------------------------
+          # Dateien sammeln
+          # ------------------------------------------------------
           FILES=()
 
           if [[ -f "release/aescrypto-linux" ]]; then
@@ -201,15 +209,17 @@ jobs:
           fi
 
           if [[ ${#FILES[@]} -eq 0 ]]; then
-            echo "No build artifacts found."
+            echo "ERROR: No build artifacts found."
             exit 1
           fi
 
-          echo "Files to upload:"
+          echo "Files for release:"
           printf '%s\n' "${FILES[@]}"
           echo ""
 
-          # Prüfen, ob bereits ein Release für diesen Tag existiert
+          # ------------------------------------------------------
+          # Prüfen, ob Release bereits existiert
+          # ------------------------------------------------------
           if gh release view "$TAG" >/dev/null 2>&1; then
 
             echo "Release $TAG already exists."
@@ -222,7 +232,7 @@ jobs:
 
           else
 
-            echo "Creating new release $TAG..."
+            echo "Creating new GitHub Release $TAG..."
 
             gh release create \
               "$TAG" \
@@ -231,3 +241,7 @@ jobs:
               --generate-notes
 
           fi
+
+          echo ""
+          echo "Release successfully created/updated:"
+          echo "$TAG"
