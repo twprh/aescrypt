@@ -1,30 +1,21 @@
 name: Build Python application
 
 on:
-#  push:
-#    branches:
-#      - main
-#    tags:
-#      - "v*"
-
   workflow_dispatch:
 
 permissions:
   contents: write
 
-
 jobs:
 
   # ============================================================
-  # LINUX
+  # Linux Build
   # ============================================================
-
   build-linux:
     name: Build Linux
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v7
 
@@ -64,15 +55,13 @@ jobs:
 
 
   # ============================================================
-  # WINDOWS
+  # Windows Build
   # ============================================================
-
   build-windows:
     name: Build Windows
     runs-on: windows-latest
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v7
 
@@ -115,74 +104,130 @@ jobs:
 
 
   # ============================================================
-  # WINDOWS RELEASE
+  # GitHub Release
+  #
+  # Wird nur ausgeführt, wenn der Workflow manuell auf
+  # einem Tag gestartet wird, der mit "v" beginnt.
+  #
+  # Beispiele:
+  #   v1.0.0
+  #   v1.1.0
+  #   v2.0.0
+  #
+  # Wenn nur ein Build erfolgreich ist, wird auch nur dieses
+  # Programm veröffentlicht.
   # ============================================================
-
-  release-windows:
-    name: Release Windows
-
-    needs:
-      - build-windows
-
-    if: startsWith(github.ref, 'refs/tags/v')
-
+  release:
+    name: Create GitHub Release
     runs-on: ubuntu-latest
-
-    steps:
-
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: aescrypto-windows
-          path: release
-
-      - name: Show release files
-        run: |
-          ls -la release
-
-      - name: Create Windows GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            release/aescrypto-windows.exe \
-            --title "${{ github.ref_name }}" \
-            --generate-notes
-
-
-  # ============================================================
-  # LINUX RELEASE
-  # ============================================================
-
-  release-linux:
-    name: Release Linux
 
     needs:
       - build-linux
+      - build-windows
 
-    if: startsWith(github.ref, 'refs/tags/v')
-
-    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      startsWith(github.ref, 'refs/tags/v')
 
     steps:
 
+      # ----------------------------------------------------------
+      # Prüfen, ob mindestens ein Build erfolgreich war
+      # ----------------------------------------------------------
+      - name: Check build results
+        shell: bash
+        run: |
+          echo "Linux build:   ${{ needs.build-linux.result }}"
+          echo "Windows build: ${{ needs.build-windows.result }}"
+
+          if [[ "${{ needs.build-linux.result }}" != "success" ]] && \
+             [[ "${{ needs.build-windows.result }}" != "success" ]]; then
+            echo "Both builds failed."
+            echo "No release will be created."
+            exit 1
+          fi
+
+
+      # ----------------------------------------------------------
+      # Linux Artifact herunterladen
+      # Nur wenn Linux erfolgreich gebaut wurde
+      # ----------------------------------------------------------
       - name: Download Linux artifact
+        if: needs.build-linux.result == 'success'
         uses: actions/download-artifact@v8
         with:
           name: aescrypto-linux
           path: release
 
-      - name: Show release files
-        run: |
-          ls -la release
 
-      - name: Create Linux GitHub Release
+      # ----------------------------------------------------------
+      # Windows Artifact herunterladen
+      # Nur wenn Windows erfolgreich gebaut wurde
+      # ----------------------------------------------------------
+      - name: Download Windows artifact
+        if: needs.build-windows.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: aescrypto-windows
+          path: release
+
+
+      # ----------------------------------------------------------
+      # GitHub Release erstellen
+      # ----------------------------------------------------------
+      - name: Create or update GitHub Release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-
         run: |
-          gh release create "${{ github.ref_name }}" \
-            release/aescrypto-linux \
-            --title "${{ github.ref_name }}" \
-            --generate-notes
+          set -e
+
+          TAG="${{ github.ref_name }}"
+
+          echo "Release tag: $TAG"
+          echo ""
+          echo "Available files:"
+          ls -lah release || true
+          echo ""
+
+          FILES=()
+
+          if [[ -f "release/aescrypto-linux" ]]; then
+            FILES+=("release/aescrypto-linux")
+          fi
+
+          if [[ -f "release/aescrypto-windows.exe" ]]; then
+            FILES+=("release/aescrypto-windows.exe")
+          fi
+
+          if [[ ${#FILES[@]} -eq 0 ]]; then
+            echo "No build artifacts found."
+            exit 1
+          fi
+
+          echo "Files to upload:"
+          printf '%s\n' "${FILES[@]}"
+          echo ""
+
+          # Prüfen, ob bereits ein Release für diesen Tag existiert
+          if gh release view "$TAG" >/dev/null 2>&1; then
+
+            echo "Release $TAG already exists."
+            echo "Uploading/updating artifacts..."
+
+            gh release upload \
+              "$TAG" \
+              "${FILES[@]}" \
+              --clobber
+
+          else
+
+            echo "Creating new release $TAG..."
+
+            gh release create \
+              "$TAG" \
+              "${FILES[@]}" \
+              --title "$TAG" \
+              --generate-notes
+
+          fi
