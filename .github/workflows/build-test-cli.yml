@@ -39,8 +39,7 @@ jobs:
             --clean \
             --noconfirm \
             --onefile \
-            --windowed \
-            --collect-all tkinterdnd2 \
+            --console \
             --name aescrypto \
             aes_cli.py
 
@@ -86,8 +85,7 @@ jobs:
             --clean `
             --noconfirm `
             --onefile `
-            --windowed `
-            --collect-submodules tkinterdnd2 `
+            --console `
             --name aescrypto `
             aes_cli.py
 
