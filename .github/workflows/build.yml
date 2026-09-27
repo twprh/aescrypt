@@ -1,0 +1,138 @@
+name: Build Python application
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller \
+            --clean \
+            --onefile \
+            --name mein-programm \
+            main.py
+
+      - name: Rename Linux executable
+        run: |
+          mv dist/mein-programm dist/mein-programm-linux
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mein-programm-linux
+          path: dist/mein-programm
+          if-no-files-found: error
+
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller `
+            --clean `
+            --onefile `
+            --name mein-programm `
+            main.py
+
+      - name: Rename Windows executable
+        shell: pwsh
+        run: |
+          Rename-Item `
+            -Path "dist\mein-programm.exe" `
+            -NewName "mein-programm-windows.exe"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mein-programm-windows
+          path: dist/mein-programm-windows.exe
+          if-no-files-found: error
+
+
+  release:
+    name: Create GitHub Release
+    needs:
+      - build-linux
+      - build-windows
+
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: mein-programm-linux
+          path: release
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: mein-programm-windows
+          path: release
+
+      - name: Show release files
+        run: |
+          ls -la release
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            release/mein-programm-linux \
+            release/mein-programm-windows.exe \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
