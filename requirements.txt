@@ -2,3 +2,15 @@ cryptography
 pystray
 Pillow
 tkinterdnd2
+os
+re
+sys
+secrets
+struct
+threading
+queue
+argparse
+multiprocessing
+getpass
+io
+tempfile
