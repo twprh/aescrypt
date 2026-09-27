@@ -39,8 +39,11 @@ jobs:
         run: |
           pyinstaller \
             --clean \
+            --noconfirm \
             --onefile \
-            --name mein-programm \
+            --windowed \
+            --collect-all tkinterdnd2 \
+            --name aescrypto \
             main.py
 
       - name: Rename Linux executable
@@ -78,10 +81,13 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller `
-            --clean `
-            --onefile `
-            --name mein-programm `
+          pyinstaller \
+            --clean \
+            --noconfirm \
+            --onefile \
+            --windowed \
+            --collect-all tkinterdnd2 \
+            --name aescrypto \
             main.py
 
       - name: Rename Windows executable
