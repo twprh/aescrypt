@@ -1,6 +1,6 @@
 import multiprocessing
 
-from aes_file_crypto007 import run_cli
+from main import run_cli
 
 
 def main():
