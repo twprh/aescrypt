@@ -40,7 +40,7 @@ jobs:
             --noconfirm \
             --onefile \
             --windowed \
-            --collect-submodules tkinterdnd2 \
+            --collect-all tkinterdnd2 \
             --name aescrypto \
             main.py
 
