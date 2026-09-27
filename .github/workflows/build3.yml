@@ -120,17 +120,24 @@ jobs:
       - build-linux
       - build-windows
 
-    # Release nur dann, wenn bei "Run workflow"
-    # eine Version eingegeben wurde.
-    #
-    # always() sorgt dafür, dass der Release-Job auch dann
-    # ausgeführt werden kann, wenn einer der beiden Builds
+    # Release nur erstellen, wenn eine Version angegeben wurde.
+    # always() sorgt dafür, dass ein erfolgreicher Plattform-Build
+    # trotzdem veröffentlicht werden kann, wenn die andere Plattform
     # fehlgeschlagen ist.
     if: |
       always() &&
       inputs.release_version != ''
 
     steps:
+
+      # ----------------------------------------------------------
+      # Repository auschecken
+      #
+      # WICHTIG:
+      # gh release create benötigt ein Git-Repository.
+      # ----------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
       # ----------------------------------------------------------
       # Prüfen, ob mindestens ein Build erfolgreich war
@@ -148,7 +155,6 @@ jobs:
             exit 1
           fi
 
-
       # ----------------------------------------------------------
       # Linux Artifact herunterladen
       # ----------------------------------------------------------
@@ -158,7 +164,6 @@ jobs:
         with:
           name: aescrypto-linux
           path: release
-
 
       # ----------------------------------------------------------
       # Windows Artifact herunterladen
@@ -170,9 +175,8 @@ jobs:
           name: aescrypto-windows
           path: release
 
-
       # ----------------------------------------------------------
-      # Release erstellen
+      # GitHub Release erstellen
       # ----------------------------------------------------------
       - name: Create GitHub Release
         shell: bash
