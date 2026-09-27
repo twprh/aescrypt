@@ -1,4 +1,3 @@
-```yaml
 name: Build Python application cli
 
 on:
