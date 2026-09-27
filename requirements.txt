@@ -1,0 +1,4 @@
+cryptography
+pystray
+Pillow
+tkinterdnd2
