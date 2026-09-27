@@ -1,6 +1,6 @@
 import tkinter as tk
 
-from aes_file_crypto007 import CryptoGUI
+from main import CryptoGUI
 
 
 def main():
