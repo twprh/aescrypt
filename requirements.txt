@@ -1,4 +1,4 @@
-cryptography
-pystray
-Pillow
-tkinterdnd2
+cryptography==41.0.7
+pystray==0.19.5
+Pillow==10.2.0
+tkinterdnd2==0.6.3
