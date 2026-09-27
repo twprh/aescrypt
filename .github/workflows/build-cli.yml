@@ -1,4 +1,4 @@
-name: Build Python application cli
+name: Build-cli
 
 on:
   workflow_dispatch:
