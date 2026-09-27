@@ -80,7 +80,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build with PyInstaller
-        run: |
+        run: 
           pyinstaller \
             --clean \
             --noconfirm \
