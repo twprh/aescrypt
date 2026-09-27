@@ -1,3 +1,4 @@
+```yaml
 name: Build Python application cli
 
 on:
@@ -40,23 +41,19 @@ jobs:
             --noconfirm \
             --onefile \
             --console \
-            --name aescrypto \
+            --name aescrypt-cli \
             aes_cli.py
-
-      - name: Rename Linux executable
-        run: |
-          mv dist/aescrypto dist/aescrypto-linux
 
       - name: Show Linux executable size
         run: |
-          ls -lh dist/aescrypto-linux
-          du -h dist/aescrypto-linux
+          ls -lh dist/aescrypt-cli
+          du -h dist/aescrypt-cli
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v7
         with:
-          name: aescrypto-linux
-          path: dist/aescrypto-linux
+          name: aescrypt-cli-linux
+          path: dist/aescrypt-cli
           if-no-files-found: error
 
   build-windows:
@@ -86,27 +83,20 @@ jobs:
             --noconfirm `
             --onefile `
             --console `
-            --name aescrypto `
+            --name aescrypt-cli `
             aes_cli.py
-
-      - name: Rename Windows executable
-        shell: pwsh
-        run: |
-          Rename-Item `
-            -Path "dist\aescrypto.exe" `
-            -NewName "aescrypto-windows.exe"
 
       - name: Show Windows executable size
         shell: pwsh
         run: |
-          Get-Item "dist\aescrypto-windows.exe" |
+          Get-Item "dist\aescrypt-cli.exe" |
             Select-Object Name, Length
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
-          name: aescrypto-windows
-          path: dist/aescrypto-windows.exe
+          name: aescrypt-cli-windows
+          path: dist/aescrypt-cli.exe
           if-no-files-found: error
 
   release:
@@ -142,14 +132,14 @@ jobs:
         if: needs.build-linux.result == 'success'
         uses: actions/download-artifact@v8
         with:
-          name: aescrypto-linux
+          name: aescrypt-cli-linux
           path: release
 
       - name: Download Windows artifact
         if: needs.build-windows.result == 'success'
         uses: actions/download-artifact@v8
         with:
-          name: aescrypto-windows
+          name: aescrypt-cli-windows
           path: release
 
       - name: Create GitHub Release
@@ -172,12 +162,12 @@ jobs:
 
           FILES=()
 
-          if [[ -f "release/aescrypto-linux" ]]; then
-            FILES+=("release/aescrypto-linux")
+          if [[ -f "release/aescrypt-cli" ]]; then
+            FILES+=("release/aescrypt-cli")
           fi
 
-          if [[ -f "release/aescrypto-windows.exe" ]]; then
-            FILES+=("release/aescrypto-windows.exe")
+          if [[ -f "release/aescrypt-cli.exe" ]]; then
+            FILES+=("release/aescrypt-cli.exe")
           fi
 
           if [[ ${#FILES[@]} -eq 0 ]]; then
@@ -207,3 +197,4 @@ jobs:
           fi
 
           echo "Release successfully created/updated: $TAG"
+```
