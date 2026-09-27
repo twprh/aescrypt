@@ -90,13 +90,6 @@ jobs:
             --name aescrypto 
             main.py
 
-      - name: Rename Windows executable
-        shell: pwsh
-        run: |
-          Rename-Item `
-            -Path "dist\aescrypto\aescrypto.exe" `
-            -NewName "aescrypto.exe"
-
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
