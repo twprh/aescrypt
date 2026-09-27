@@ -1,4 +1,4 @@
-name: Build Python application 01
+name: Build Python application 
 
 on:
   workflow_dispatch:
