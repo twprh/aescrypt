@@ -16,6 +16,7 @@ import tempfile
 # Linux GUI: Single-Instance-Sperre
 if sys.platform.startswith("linux"):
     import fcntl
+
 from urllib.parse import unquote, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -42,7 +43,6 @@ except Exception:
 
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.exceptions import InvalidTag
 
@@ -103,7 +103,7 @@ def build_header(salt: bytes, nonce: bytes) -> bytes:
     if len(nonce) != NONCE_SIZE:
         raise ValueError("Ungültige Nonce-Länge.")
 
-    # Der Dateiname steht NICHT mehr im Klartext im Header.
+    # Der Dateiname steht NICHT im Klartext im Header.
     # Er wird als erster Teil der GCM-Nutzdaten verschlüsselt.
     return (
         MAGIC
@@ -118,12 +118,16 @@ def read_header(fin):
     magic = fin.read(len(MAGIC))
 
     if magic != MAGIC:
-        raise ValueError("Ungültiges oder nicht unterstütztes Dateiformat.")
+        raise ValueError(
+            "Ungültiges oder nicht unterstütztes Dateiformat."
+        )
 
     version = fin.read(1)
 
     if len(version) != 1 or version[0] != FORMAT_VERSION:
-        raise ValueError("Nicht unterstützte Dateiformat-Version.")
+        raise ValueError(
+            "Nicht unterstützte Dateiformat-Version."
+        )
 
     salt = fin.read(SALT_SIZE)
 
@@ -147,15 +151,28 @@ def read_header(fin):
 
 def install_temp_no_overwrite(tmp_path, output_path):
     """Installiert eine fertige Datei atomar, ohne ein vorhandenes Ziel zu überschreiben."""
+
     try:
-        os.link(tmp_path, output_path)
+
+        os.link(
+            tmp_path,
+            output_path,
+        )
+
     except FileExistsError:
-        raise FileExistsError(f"Zieldatei existiert bereits: {output_path}")
+
+        raise FileExistsError(
+            f"Zieldatei existiert bereits: {output_path}"
+        )
+
     except OSError as e:
+
         raise OSError(
             f"Zieldatei konnte nicht sicher angelegt werden: {e}"
         )
+
     else:
+
         os.unlink(tmp_path)
 
 
@@ -170,16 +187,27 @@ def encrypt_file(
     progress_cb=None,
 ):
 
-    input_path = os.path.abspath(input_path)
-    output_path = os.path.abspath(output_path)
+    input_path = os.path.abspath(
+        input_path
+    )
+
+    output_path = os.path.abspath(
+        output_path
+    )
 
     if input_path == output_path:
+
         raise ValueError(
             "Quelle und Ziel dürfen nicht identisch sein."
         )
 
-    salt = secrets.token_bytes(SALT_SIZE)
-    nonce = secrets.token_bytes(NONCE_SIZE)
+    salt = secrets.token_bytes(
+        SALT_SIZE
+    )
+
+    nonce = secrets.token_bytes(
+        NONCE_SIZE
+    )
 
     aes_key = derive_key(
         password,
@@ -191,6 +219,7 @@ def encrypt_file(
     ).encode("utf-8")
 
     if len(orig_name) > MAX_NAME_LEN:
+
         raise ValueError(
             "Dateiname zu lang."
         )
@@ -203,7 +232,10 @@ def encrypt_file(
     # Der Dateiname ist Teil der verschlüsselten GCM-Nutzdaten.
     # Auch seine Länge wird nicht mehr im Klartext gespeichert.
     encrypted_metadata = (
-        struct.pack(">I", len(orig_name))
+        struct.pack(
+            ">I",
+            len(orig_name),
+        )
         + orig_name
     )
 
@@ -247,14 +279,20 @@ def encrypt_file(
             )
 
             encryptor = cipher.encryptor()
-            encryptor.authenticate_additional_data(header)
+
+            encryptor.authenticate_additional_data(
+                header
+            )
 
             encrypted_metadata = encryptor.update(
                 encrypted_metadata
             )
 
             if encrypted_metadata:
-                fout.write(encrypted_metadata)
+
+                fout.write(
+                    encrypted_metadata
+                )
 
             while True:
 
@@ -270,6 +308,7 @@ def encrypt_file(
                 )
 
                 if encrypted:
+
                     fout.write(
                         encrypted
                     )
@@ -277,6 +316,7 @@ def encrypt_file(
                 bytes_read += len(chunk)
 
                 if progress_cb:
+
                     progress_cb(
                         bytes_read,
                         file_size,
@@ -285,11 +325,15 @@ def encrypt_file(
             final_data = encryptor.finalize()
 
             if final_data:
-                fout.write(final_data)
+
+                fout.write(
+                    final_data
+                )
 
             tag = encryptor.tag
 
             if len(tag) != TAG_SIZE:
+
                 raise ValueError(
                     "Ungültige GCM-Tag-Länge."
                 )
@@ -341,6 +385,7 @@ def decrypt_file(
     )
 
     if input_path == output_path:
+
         raise ValueError(
             "Quelle und Ziel dürfen nicht identisch sein."
         )
@@ -364,6 +409,7 @@ def decrypt_file(
     )
 
     if fsize < minimum_size:
+
         raise ValueError(
             "Datei zu klein oder beschädigt."
         )
@@ -391,6 +437,7 @@ def decrypt_file(
                 + 1
                 + TAG_SIZE
             ):
+
                 raise ValueError(
                     "Ungültige Dateistruktur."
                 )
@@ -404,6 +451,7 @@ def decrypt_file(
             )
 
             if len(tag) != TAG_SIZE:
+
                 raise ValueError(
                     "Authentifizierungs-Tag fehlt."
                 )
@@ -417,6 +465,7 @@ def decrypt_file(
             if ciphertext_size < (
                 NAME_LEN_SIZE + 1
             ):
+
                 raise ValueError(
                     "Ungültige Dateistruktur."
                 )
@@ -435,7 +484,10 @@ def decrypt_file(
             )
 
             decryptor = cipher.decryptor()
-            decryptor.authenticate_additional_data(header)
+
+            decryptor.authenticate_additional_data(
+                header
+            )
 
             out_dir = (
                 os.path.dirname(output_path)
@@ -484,6 +536,7 @@ def decrypt_file(
                     )
 
                     if len(ct_chunk) != to_read:
+
                         raise ValueError(
                             "Verschlüsselte Datei ist unvollständig."
                         )
@@ -508,10 +561,16 @@ def decrypt_file(
 
                                 name_len = struct.unpack(
                                     ">I",
-                                    metadata[:NAME_LEN_SIZE],
+                                    metadata[
+                                        :NAME_LEN_SIZE
+                                    ],
                                 )[0]
 
-                                if name_len == 0 or name_len > MAX_NAME_LEN:
+                                if (
+                                    name_len == 0
+                                    or name_len > MAX_NAME_LEN
+                                ):
+
                                     raise ValueError(
                                         "Ungültiges Dateiformat: "
                                         "ungültiger Dateiname."
@@ -531,8 +590,13 @@ def decrypt_file(
                                 )
 
                                 try:
-                                    name_bytes.decode("utf-8")
+
+                                    name_bytes.decode(
+                                        "utf-8"
+                                    )
+
                                 except UnicodeDecodeError:
+
                                     raise ValueError(
                                         "Ungültiger Dateiname."
                                     )
@@ -544,6 +608,7 @@ def decrypt_file(
                                 ]
 
                                 if remaining:
+
                                     fout.write(
                                         remaining
                                     )
@@ -551,15 +616,17 @@ def decrypt_file(
                                 metadata.clear()
 
                         else:
-                            fout.write(plaintext)
+
+                            fout.write(
+                                plaintext
+                            )
 
                     bytes_read += len(
                         ct_chunk
                     )
 
                     if progress_cb:
-                        # Nur die eigentlichen Dateidaten zählen;
-                        # der verschlüsselte Dateiname ist Metadaten.
+
                         data_done = max(
                             0,
                             bytes_read
@@ -583,15 +650,15 @@ def decrypt_file(
                         )
 
                         progress_cb(
-                            min(data_done, data_total),
+                            min(
+                                data_done,
+                                data_total,
+                            ),
                             data_total,
                         )
 
-                # ------------------------------------------------
                 # Sicherheitskritisch:
-                #
                 # Erst finalize() bestätigt die GCM-Authentizität.
-                # ------------------------------------------------
 
                 final_plaintext = (
                     decryptor.finalize()
@@ -613,10 +680,16 @@ def decrypt_file(
 
                             name_len = struct.unpack(
                                 ">I",
-                                metadata[:NAME_LEN_SIZE],
+                                metadata[
+                                    :NAME_LEN_SIZE
+                                ],
                             )[0]
 
-                            if name_len == 0 or name_len > MAX_NAME_LEN:
+                            if (
+                                name_len == 0
+                                or name_len > MAX_NAME_LEN
+                            ):
+
                                 raise ValueError(
                                     "Ungültiges Dateiformat: "
                                     "ungültiger Dateiname."
@@ -636,8 +709,13 @@ def decrypt_file(
                             )
 
                             try:
-                                name_bytes.decode("utf-8")
+
+                                name_bytes.decode(
+                                    "utf-8"
+                                )
+
                             except UnicodeDecodeError:
+
                                 raise ValueError(
                                     "Ungültiger Dateiname."
                                 )
@@ -649,14 +727,21 @@ def decrypt_file(
                             ]
 
                             if remaining:
-                                fout.write(remaining)
+
+                                fout.write(
+                                    remaining
+                                )
 
                             metadata.clear()
 
                     else:
-                        fout.write(final_plaintext)
+
+                        fout.write(
+                            final_plaintext
+                        )
 
                 if not metadata_done:
+
                     raise ValueError(
                         "Verschlüsselte Datei enthält keinen gültigen Dateinamen."
                     )
@@ -688,17 +773,23 @@ def decrypt_file(
         if tmp_path:
 
             try:
-                os.unlink(
-                    tmp_path
-                )
+                os.unlink(tmp_path)
             except OSError:
                 pass
 
 
-def get_original_filename(enc_path, password):
+def get_original_filename(
+    enc_path,
+    password,
+):
 
-    enc_path = os.path.abspath(enc_path)
-    fsize = os.path.getsize(enc_path)
+    enc_path = os.path.abspath(
+        enc_path
+    )
+
+    fsize = os.path.getsize(
+        enc_path
+    )
 
     header_size = (
         len(MAGIC)
@@ -707,7 +798,13 @@ def get_original_filename(enc_path, password):
         + NONCE_SIZE
     )
 
-    if fsize < header_size + NAME_LEN_SIZE + 1 + TAG_SIZE:
+    if fsize < (
+        header_size
+        + NAME_LEN_SIZE
+        + 1
+        + TAG_SIZE
+    ):
+
         raise ValueError(
             "Datei zu klein oder beschädigt."
         )
@@ -727,7 +824,9 @@ def get_original_filename(enc_path, password):
             fsize - TAG_SIZE
         )
 
-        tag = fin.read(TAG_SIZE)
+        tag = fin.read(
+            TAG_SIZE
+        )
 
         ciphertext_size = (
             fsize
@@ -735,7 +834,10 @@ def get_original_filename(enc_path, password):
             - TAG_SIZE
         )
 
-        if ciphertext_size < NAME_LEN_SIZE + 1:
+        if ciphertext_size < (
+            NAME_LEN_SIZE + 1
+        ):
+
             raise ValueError(
                 "Ungültige Dateistruktur."
             )
@@ -747,81 +849,135 @@ def get_original_filename(enc_path, password):
 
         cipher = Cipher(
             algorithms.AES(aes_key),
-            modes.GCM(nonce, tag),
+            modes.GCM(
+                nonce,
+                tag,
+            ),
         )
 
         decryptor = cipher.decryptor()
-        decryptor.authenticate_additional_data(header)
 
-        fin.seek(len(header))
+        decryptor.authenticate_additional_data(
+            header
+        )
+
+        fin.seek(
+            len(header)
+        )
+
         metadata = bytearray()
 
         while len(metadata) < NAME_LEN_SIZE:
+
             chunk = fin.read(
-                min(CHUNK_SIZE, ciphertext_size - len(metadata))
+                min(
+                    CHUNK_SIZE,
+                    ciphertext_size
+                    - len(metadata),
+                )
             )
+
             if not chunk:
+
                 raise ValueError(
                     "Verschlüsselte Datei enthält keinen gültigen Dateinamen."
                 )
+
             metadata.extend(
                 decryptor.update(chunk)
             )
 
         name_len = struct.unpack(
             ">I",
-            metadata[:NAME_LEN_SIZE],
+            metadata[
+                :NAME_LEN_SIZE
+            ],
         )[0]
 
-        if name_len == 0 or name_len > MAX_NAME_LEN:
+        if (
+            name_len == 0
+            or name_len > MAX_NAME_LEN
+        ):
+
             raise ValueError(
-                "Ungültiges Dateiformat: ungültiger Dateiname."
+                "Ungültiges Dateiformat: "
+                "ungültiger Dateiname."
             )
 
-        needed = NAME_LEN_SIZE + name_len
+        needed = (
+            NAME_LEN_SIZE
+            + name_len
+        )
 
         while len(metadata) < needed:
+
             chunk = fin.read(
                 min(
                     CHUNK_SIZE,
-                    ciphertext_size - (
-                        len(metadata)
-                    ),
+                    ciphertext_size
+                    - len(metadata),
                 )
             )
+
             if not chunk:
+
                 raise ValueError(
-                    "Verschlüsselte Datei enthält keinen vollständigen Dateinamen."
+                    "Verschlüsselte Datei enthält keinen "
+                    "vollständigen Dateinamen."
                 )
+
             metadata.extend(
                 decryptor.update(chunk)
             )
 
         # Die komplette Datei muss durch den Decryptor laufen,
-        # damit der GCM-Tag geprüft werden kann. Dabei wird nichts
-        # als Klartextdatei auf die Platte geschrieben.
+        # damit der GCM-Tag geprüft werden kann.
         consumed = len(metadata)
+
         while consumed < ciphertext_size:
-            chunk = fin.read(
-                min(CHUNK_SIZE, ciphertext_size - consumed)
+
+            to_read = min(
+                CHUNK_SIZE,
+                ciphertext_size - consumed,
             )
-            if len(chunk) != min(CHUNK_SIZE, ciphertext_size - consumed):
+
+            chunk = fin.read(
+                to_read
+            )
+
+            if len(chunk) != to_read:
+
                 raise ValueError(
                     "Verschlüsselte Datei ist unvollständig."
                 )
-            decryptor.update(chunk)
+
+            decryptor.update(
+                chunk
+            )
+
             consumed += len(chunk)
 
         decryptor.finalize()
 
         name_bytes = bytes(
-            metadata[NAME_LEN_SIZE:NAME_LEN_SIZE + name_len]
+            metadata[
+                NAME_LEN_SIZE:
+                NAME_LEN_SIZE + name_len
+            ]
         )
 
         try:
-            return name_bytes.decode("utf-8")
+
+            return name_bytes.decode(
+                "utf-8"
+            )
+
         except UnicodeDecodeError:
-            raise ValueError("Ungültiger Dateiname.")
+
+            raise ValueError(
+                "Ungültiger Dateiname."
+            )
+
 
 # ============================================================
 # Originaldatei löschen
@@ -836,6 +992,7 @@ def delete_original_file(filepath):
         return
 
     try:
+
         os.remove(filepath)
 
     except OSError as e:
@@ -893,6 +1050,7 @@ def collect_files(paths):
                     )
 
                     if not os.path.islink(fp):
+
                         files.append(
                             os.path.abspath(fp)
                         )
@@ -916,9 +1074,15 @@ def collect_files(paths):
 
 def make_encrypt_output_path(fpath):
 
-    out_path = fpath + ".enc"
+    out_path = (
+        fpath
+        + ".enc"
+    )
 
-    if not os.path.exists(out_path):
+    if not os.path.exists(
+        out_path
+    ):
+
         return out_path
 
     base, ext = os.path.splitext(
@@ -938,25 +1102,62 @@ def make_encrypt_output_path(fpath):
         if not os.path.exists(
             candidate
         ):
+
             return candidate
 
         counter += 1
 
 
-def make_decrypt_output_path(fpath, password):
+def make_encrypted_filename_output_path(fpath):
+    """
+    Erstellt einen zufälligen, nicht sprechenden Dateinamen.
+
+    Der ursprüngliche Dateiname befindet sich weiterhin verschlüsselt
+    innerhalb der AES-GCM-Nutzdaten und wird bei der Entschlüsselung
+    wiederhergestellt.
+    """
+
+    directory = os.path.dirname(
+        os.path.abspath(fpath)
+    )
+
+    while True:
+
+        random_name = (
+            "AES_"
+            + secrets.token_hex(24)
+            + ".enc"
+        )
+
+        out_path = os.path.join(
+            directory,
+            random_name,
+        )
+
+        if not os.path.lexists(
+            out_path
+        ):
+
+            return out_path
+
+
+def make_decrypt_output_path(
+    fpath,
+    password,
+):
 
     orig_name = get_original_filename(
         fpath,
         password,
     )
 
-    # Nur ein Dateiname, niemals ein
-    # Pfad aus dem Header.
+    # Nur ein Dateiname, niemals ein Pfad aus dem Header.
     orig_name = os.path.basename(
         orig_name
     )
 
     if not orig_name:
+
         raise ValueError(
             "Ungültiger Original-Dateiname."
         )
@@ -973,6 +1174,7 @@ def make_decrypt_output_path(fpath, password):
     if not os.path.exists(
         out_path
     ):
+
         return out_path
 
     name, ext = os.path.splitext(
@@ -993,6 +1195,7 @@ def make_decrypt_output_path(fpath, password):
         if not os.path.exists(
             candidate
         ):
+
             return candidate
 
         counter += 1
@@ -1006,6 +1209,7 @@ def process_single(
     fpath,
     password,
     delete_original,
+    encrypt_filename=False,
 ):
 
     mode = (
@@ -1020,11 +1224,21 @@ def process_single(
 
         if mode == "encrypt":
 
-            out_path = (
-                make_encrypt_output_path(
-                    fpath
+            if encrypt_filename:
+
+                out_path = (
+                    make_encrypted_filename_output_path(
+                        fpath
+                    )
                 )
-            )
+
+            else:
+
+                out_path = (
+                    make_encrypt_output_path(
+                        fpath
+                    )
+                )
 
             encrypt_file(
                 fpath,
@@ -1047,8 +1261,7 @@ def process_single(
                 password,
             )
 
-        # Original NUR nach erfolgreicher
-        # Kryptografie löschen.
+        # Original NUR nach erfolgreicher Kryptografie löschen.
         if delete_original:
 
             try:
@@ -1084,12 +1297,14 @@ def _cli_process_single(
     fpath,
     password,
     delete_original,
+    encrypt_filename=False,
 ):
 
     ok, msg = process_single(
         fpath,
         password,
         delete_original,
+        encrypt_filename,
     )
 
     return (
@@ -1145,6 +1360,15 @@ def run_cli():
         help="Original nicht löschen",
     )
 
+    parser.add_argument(
+        "--encrypt-filename",
+        action="store_true",
+        help=(
+            "Beim Verschlüsseln einen zufälligen, "
+            "nicht sprechenden Dateinamen verwenden"
+        ),
+    )
+
     args = parser.parse_args()
 
     if not args.files and not args.dirs:
@@ -1160,13 +1384,25 @@ def run_cli():
         )
 
     try:
-        password = getpass.getpass("Passwort eingeben: ")
+
+        password = getpass.getpass(
+            "Passwort eingeben: "
+        )
+
     except KeyboardInterrupt:
-        print("\nAbbruch durch Benutzer.")
+
+        print(
+            "\nAbbruch durch Benutzer."
+        )
+
         sys.exit(1)
 
     if not password:
-        print("Leeres Passwort nicht erlaubt.")
+
+        print(
+            "Leeres Passwort nicht erlaubt."
+        )
+
         sys.exit(1)
 
     all_files = collect_files(
@@ -1198,6 +1434,7 @@ def run_cli():
                 f,
                 password,
                 not args.keep_original,
+                args.encrypt_filename,
             ): f
             for f in all_files
         }
@@ -1211,8 +1448,11 @@ def run_cli():
             print(result)
 
             if result.startswith("OK:"):
+
                 successful += 1
+
             else:
+
                 failed += 1
 
     print()
@@ -1462,6 +1702,7 @@ class CryptoGUI:
         self._update_listbox()
 
         if initial_paths:
+
             self._add_paths(
                 initial_paths
             )
@@ -1645,6 +1886,23 @@ class CryptoGUI:
             variable=self.delete_original,
         ).pack(
             anchor=tk.W,
+            pady=(0, 3),
+        )
+
+        # ----------------------------------------------------
+        # Dateinamen verschlüsseln
+        # ----------------------------------------------------
+
+        self.encrypt_filename = tk.BooleanVar(
+            value=False
+        )
+
+        ttk.Checkbutton(
+            main,
+            text="Dateinamen ebenfalls verschlüsseln",
+            variable=self.encrypt_filename,
+        ).pack(
+            anchor=tk.W,
             pady=(0, 6),
         )
 
@@ -1769,9 +2027,11 @@ class CryptoGUI:
             )
 
             try:
+
                 self.listbox.config(
                     background=self.DROP_HOVER_BG
                 )
+
             except Exception:
                 pass
 
@@ -1942,6 +2202,7 @@ class CryptoGUI:
             )
 
             if norm and hits == len(norm):
+
                 return norm
 
             if hits > best_hits:
@@ -1984,6 +2245,7 @@ class CryptoGUI:
             added += 1
 
         if added:
+
             self._update_listbox()
 
         return (
@@ -2088,22 +2350,24 @@ class CryptoGUI:
         self.closing = True
 
         # Passwortreferenz beim endgültigen Beenden der
-        # GUI-Instanz verwerfen. Python garantiert kein
-        # physisches Überschreiben des zuvor belegten
-        # Speicherbereichs, aber die Anwendung hält danach
-        # keine eigene Referenz mehr darauf.
+        # GUI-Instanz verwerfen.
         self._session_password = None
+
         self.pass_var.set("")
 
         self._stop_tray()
 
         try:
+
             self.root.quit()
+
         except tk.TclError:
             pass
 
         try:
+
             self.root.destroy()
+
         except tk.TclError:
             pass
 
@@ -2117,7 +2381,9 @@ class CryptoGUI:
         self.tray = None
 
         try:
+
             tray.stop()
+
         except Exception:
             pass
 
@@ -2274,9 +2540,11 @@ class CryptoGUI:
                 total_files += 1
 
                 try:
+
                     total_size += os.path.getsize(
                         p
                     )
+
                 except OSError:
                     pass
 
@@ -2339,6 +2607,7 @@ class CryptoGUI:
         ):
 
             if b < 1024:
+
                 return f"{b:.1f} {u}"
 
             b /= 1024
@@ -2362,6 +2631,7 @@ class CryptoGUI:
         )
 
         if paths:
+
             self._add_paths(
                 paths
             )
@@ -2373,6 +2643,7 @@ class CryptoGUI:
         )
 
         if path:
+
             self._add_paths(
                 [path]
             )
@@ -2406,27 +2677,29 @@ class CryptoGUI:
 
             return
 
-        # Komfortfunktion: Passwort kann einmal eingegeben und
-        # anschließend für die gesamte Laufzeit der GUI-Instanz
-        # intern im RAM verwendet werden.
-        entered_password = self.pass_var.get()
+        entered_password = (
+            self.pass_var.get()
+        )
 
         if entered_password:
-            self._session_password = entered_password
 
-        password = self._session_password
+            self._session_password = (
+                entered_password
+            )
+
+        password = (
+            self._session_password
+        )
 
         if not password:
+
             messagebox.showwarning(
                 "Hinweis",
                 "Passwort darf nicht leer sein.",
             )
+
             return
 
-        # Das Passwortfeld bleibt leer; das Passwort liegt nur noch
-        # in der internen Laufzeitreferenz und wird nicht persistent
-        # gespeichert. Eine erneute Eingabe ersetzt das gespeicherte
-        # Laufzeitpasswort.
         self.pass_var.set("")
 
         self.worker_running = True
@@ -2447,6 +2720,10 @@ class CryptoGUI:
 
         delete_original = (
             self.delete_original.get()
+        )
+
+        encrypt_filename = (
+            self.encrypt_filename.get()
         )
 
         def worker():
@@ -2533,11 +2810,21 @@ class CryptoGUI:
 
                         if mode == "encrypt":
 
-                            out_path = (
-                                make_encrypt_output_path(
-                                    fpath
+                            if encrypt_filename:
+
+                                out_path = (
+                                    make_encrypted_filename_output_path(
+                                        fpath
+                                    )
                                 )
-                            )
+
+                            else:
+
+                                out_path = (
+                                    make_encrypt_output_path(
+                                        fpath
+                                    )
+                                )
 
                         else:
 
@@ -2548,7 +2835,12 @@ class CryptoGUI:
                                 )
                             )
 
-                        output_existed_before = os.path.lexists(out_path)
+                        output_existed_before = (
+                            os.path.lexists(
+                                out_path
+                            )
+                        )
+
                         current_out = out_path
 
                         def file_progress(
@@ -2558,6 +2850,7 @@ class CryptoGUI:
                         ):
 
                             if total_bytes <= 0:
+
                                 pct = 0
 
                             else:
@@ -2602,11 +2895,8 @@ class CryptoGUI:
                                 file_progress,
                             )
 
-                        # ------------------------------------------------
                         # Nur nach vollständig erfolgreicher
                         # Kryptografie löschen.
-                        # ------------------------------------------------
-
                         if delete_original:
 
                             try:
@@ -2648,15 +2938,10 @@ class CryptoGUI:
                             f"{fpath}: {e}"
                         )
 
-                        # ------------------------------------------------
-                        # Sicherheitsregel:
-                        #
                         # Bei Fehler bleibt das Original erhalten.
-                        #
-                        # Nur ein ZIEL, das während dieses
+                        # Nur ein Ziel, das während dieses
                         # Verarbeitungsschrittes entstanden ist,
                         # darf entfernt werden.
-                        # ------------------------------------------------
 
                         if (
                             current_out
@@ -3072,13 +3357,26 @@ if __name__ == "__main__":
     # --------------------------------------------------------
     # Linux: nur eine GUI-Instanz gleichzeitig
     # --------------------------------------------------------
+
     _instance_lock_file = None
 
     if sys.platform.startswith("linux"):
-        _runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
-        if _runtime_dir and os.path.isdir(_runtime_dir):
+
+        _runtime_dir = os.environ.get(
+            "XDG_RUNTIME_DIR"
+        )
+
+        if (
+            _runtime_dir
+            and os.path.isdir(
+                _runtime_dir
+            )
+        ):
+
             lock_dir = _runtime_dir
+
         else:
+
             lock_dir = tempfile.gettempdir()
 
         lock_path = os.path.join(
@@ -3087,19 +3385,38 @@ if __name__ == "__main__":
         )
 
         try:
-            _instance_lock_file = open(lock_path, "w")
+
+            _instance_lock_file = open(
+                lock_path,
+                "w",
+            )
+
             fcntl.flock(
                 _instance_lock_file.fileno(),
                 fcntl.LOCK_EX | fcntl.LOCK_NB,
             )
-        except (OSError, IOError):
+
+        except (
+            OSError,
+            IOError,
+        ):
+
             try:
-                if _instance_lock_file is not None:
+
+                if (
+                    _instance_lock_file
+                    is not None
+                ):
+
                     _instance_lock_file.close()
+
             except Exception:
                 pass
 
-            print("AES Crypto läuft bereits.")
+            print(
+                "AES Crypto läuft bereits."
+            )
+
             sys.exit(0)
 
     root = create_root()
