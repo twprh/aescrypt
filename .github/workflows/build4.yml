@@ -46,18 +46,20 @@ jobs:
 
       - name: Rename Linux executable
         run: |
-          mv dist/aescrypto dist/aescrypto-linux
+          # Da PyInstaller bei --name aescrypto ohnehin "aescrypto" erzeugt, 
+          # können wir den Namen direkt beibehalten oder explizit bestätigen:
+          mv dist/aescrypto dist/aescrypto
 
       - name: Show Linux executable size
         run: |
-          ls -lh dist/aescrypto-linux
-          du -h dist/aescrypto-linux
+          ls -lh dist/aescrypto
+          du -h dist/aescrypto
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v7
         with:
           name: aescrypto-linux
-          path: dist/aescrypto-linux
+          path: dist/aescrypto
           if-no-files-found: error
 
   build-windows:
@@ -94,21 +96,22 @@ jobs:
       - name: Rename Windows executable
         shell: pwsh
         run: |
-          Rename-Item `
-            -Path "dist\aescrypto.exe" `
-            -NewName "aescrypto-windows.exe"
+          # PyInstaller erzeugt aescrypto.exe, der Schritt bleibt zur Sicherheit bestehen
+          if (Test-Path "dist\aescrypto.exe") {
+            Write-Host "aescrypto.exe found."
+          }
 
       - name: Show Windows executable size
         shell: pwsh
         run: |
-          Get-Item "dist\aescrypto-windows.exe" |
+          Get-Item "dist\aescrypto.exe" |
             Select-Object Name, Length
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
           name: aescrypto-windows
-          path: dist/aescrypto-windows.exe
+          path: dist/aescrypto.exe
           if-no-files-found: error
 
   release:
@@ -174,12 +177,12 @@ jobs:
 
           FILES=()
 
-          if [[ -f "release/aescrypto-linux" ]]; then
-            FILES+=("release/aescrypto-linux")
+          if [[ -f "release/aescrypto" ]]; then
+            FILES+=("release/aescrypto")
           fi
 
-          if [[ -f "release/aescrypto-windows.exe" ]]; then
-            FILES+=("release/aescrypto-windows.exe")
+          if [[ -f "release/aescrypto.exe" ]]; then
+            FILES+=("release/aescrypto.exe")
           fi
 
           if [[ ${#FILES[@]} -eq 0 ]]; then
