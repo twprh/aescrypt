@@ -56,6 +56,8 @@ CHUNK_SIZE = 1024 * 1024
 MAGIC = b"AESCRYPT2"
 FORMAT_VERSION = 3
 
+APP_VERSION = "1.1.1"
+
 SALT_SIZE = 16
 NONCE_SIZE = 12
 TAG_SIZE = 16
@@ -1479,7 +1481,14 @@ def run_cli():
         description=(
             "AES Crypto CLI - "
             "Ver-/Entschlüsselung"
-        )
+        ),
+        epilog=f"Version {APP_VERSION}",
+    )
+
+    parser.add_argument(
+       "--version",
+       action="version",
+       version=f"%(prog)s {APP_VERSION}",
     )
 
     parser.add_argument(
@@ -1828,7 +1837,7 @@ class CryptoGUI:
         self.root = root
 
         self.root.title(
-            "AES Crypto"
+        f"AES Crypto {APP_VERSION}"
         )
 
         self.root.geometry(
