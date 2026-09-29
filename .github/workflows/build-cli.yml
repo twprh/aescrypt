@@ -40,19 +40,19 @@ jobs:
             --noconfirm \
             --onefile \
             --console \
-            --name aescrypt-cli \
+            --name aescrypto-cli \
             aes_cli.py
 
       - name: Show Linux executable size
         run: |
-          ls -lh dist/aescrypt-cli
-          du -h dist/aescrypt-cli
+          ls -lh dist/aescrypto-cli
+          du -h dist/aescrypto-cli
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v7
         with:
-          name: aescrypt-cli-linux
-          path: dist/aescrypt-cli
+          name: aescrypto-cli-linux
+          path: dist/aescrypto-cli
           if-no-files-found: error
 
   build-windows:
@@ -82,20 +82,20 @@ jobs:
             --noconfirm `
             --onefile `
             --console `
-            --name aescrypt-cli `
+            --name aescrypto-cli `
             aes_cli.py
 
       - name: Show Windows executable size
         shell: pwsh
         run: |
-          Get-Item "dist\aescrypt-cli.exe" |
+          Get-Item "dist\aescrypto-cli.exe" |
             Select-Object Name, Length
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
-          name: aescrypt-cli-windows
-          path: dist/aescrypt-cli.exe
+          name: aescrypto-cli-windows
+          path: dist/aescrypto-cli.exe
           if-no-files-found: error
 
   release:
@@ -131,14 +131,14 @@ jobs:
         if: needs.build-linux.result == 'success'
         uses: actions/download-artifact@v8
         with:
-          name: aescrypt-cli-linux
+          name: aescrypto-cli-linux
           path: release
 
       - name: Download Windows artifact
         if: needs.build-windows.result == 'success'
         uses: actions/download-artifact@v8
         with:
-          name: aescrypt-cli-windows
+          name: aescrypto-cli-windows
           path: release
 
       - name: Create GitHub Release
@@ -161,12 +161,12 @@ jobs:
 
           FILES=()
 
-          if [[ -f "release/aescrypt-cli" ]]; then
-            FILES+=("release/aescrypt-cli")
+          if [[ -f "release/aescrypto-cli" ]]; then
+            FILES+=("release/aescrypto-cli")
           fi
 
-          if [[ -f "release/aescrypt-cli.exe" ]]; then
-            FILES+=("release/aescrypt-cli.exe")
+          if [[ -f "release/aescrypto-cli.exe" ]]; then
+            FILES+=("release/aescrypto-cli.exe")
           fi
 
           if [[ ${#FILES[@]} -eq 0 ]]; then
@@ -196,4 +196,3 @@ jobs:
           fi
 
           echo "Release successfully created/updated: $TAG"
-
