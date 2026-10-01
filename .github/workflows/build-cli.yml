@@ -83,6 +83,7 @@ jobs:
             --onefile `
             --console `
             --name aescrypto-cli `
+            --icon aescrypto.ico `
             aes_cli.py
 
       - name: Show Windows executable size
