@@ -1279,6 +1279,18 @@ if GUI_AVAILABLE:
                 if f not in self.file_listbox.get(0, tk.END):
                     self.file_listbox.insert(tk.END, f)
 
+        def add_files(self):
+            files = filedialog.askopenfilenames(
+                title="Dateien auswählen",
+                filetypes=[
+                    ("Alle Dateien", "*"),
+                    ("Verschlüsselte Dateien", "*.enc"),
+                ],
+            )
+            for f in files:
+                if f not in self.file_listbox.get(0, tk.END):
+                    self.file_listbox.insert(tk.END, f)
+        
         def add_folder(self):
             folder = filedialog.askdirectory(title="Ordner auswählen")
             if folder:
