@@ -40,7 +40,9 @@ jobs:
             --noconfirm \
             --onefile \
             --windowed \
+            --icon=aescrypto.ico \
             --collect-all tkinterdnd2 \
+            --hidden-import=pystray.win32 \
             --name aescrypto \
             main.py
 
@@ -83,7 +85,9 @@ jobs:
             --noconfirm `
             --onefile `
             --windowed `
+            --icon=aescrypto.ico `
             --collect-submodules tkinterdnd2 `
+            --hidden-import=pystray._win32 `
             --name aescrypto `
             main.py
 
