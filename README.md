@@ -1,85 +1,51 @@
-Hier ist eine detaillierte technische Beschreibung des Dateiformats (`.enc`), basierend auf der Struktur, die im bereitgestellten Skript definiert ist.
+Übersichtliche Darstellung des Dateiaufbaus als tabellarische Übersicht:
 
 ---
 
-## 🏗️ Aufbau einer `.enc`-Datei
+### 1. AESCRYPT3-Format (Aktueller Standard)
 
-Eine `.enc`-Datei ist modular aufgebaut und gliedert sich in drei Hauptbereiche: den **Header** (Dateikopf), die **verschlüsselten Nutzdaten (Payload)** inklusive Metadaten und das **Authentifizierungs-Tag** am Ende der Datei.
+Das moderne Format teilt die Datei in einen festen Header und sequenzielle Chunks (Blöcke) auf.
 
-### 1. Header (Dateikopf)
-
-Der Header enthält alle notwendigen Informationen, die für die Entschlüsselung (außer dem Passwort selbst) erforderlich sind. Er hat eine feste Länge und wird im Klartext am Anfang der Datei gespeichert.
-
-* **Magic Bytes (`MAGIC`):**
-* *Größe:* 9 Bytes
-* *Wert:* `b"AESCRYPT2"`
-* *Zweck:* Dient als Erkennungsmerkmal, um das Dateiformat eindeutig zu identifizieren.
-
-
-* **Format-Version (`FORMAT_VERSION`):**
-* *Größe:* 1 Byte
-* *Wert:* `3` (Integer)
-* *Zweck:* Gibt die Versionsnummer des Dateiformats an, um Abwärtskompatibilität oder Fehler bei Änderungen zu steuern.
-
-
-* **Salt (`SALT_SIZE`):**
-* *Größe:* 16 Bytes (zufällig generiert)
-* *Zweck:* Wird zusammen mit dem Benutzerpasswort an die schlüsselableitende Funktion (`Scrypt`) übergeben, um Rainbow-Table-Angriffe abzuwehren.
-
-
-* **Nonce / Initialization Vector (`NONCE_SIZE`):**
-* *Größe:* 12 Bytes (zufällig generiert)
-* *Zweck:* Einmaliger Initialisierungsvektor für den AES-GCM-Modus, der sicherstellt, dass identische Klartexte bei gleicher Verschlüsselung zu unterschiedlichem Chiffrat führen.
-
-
-
----
-
-### 2. Verschlüsselte Nutzdaten & Metadaten (Payload)
-
-Der gesamte Inhalt nach dem Header – einschließlich des ursprünglichen Dateinamens – wird mittels **AES-256 im GCM-Modus** (Galois/Counter Mode) verschlüsselt.
-
-Zudem wird der Header als *Additional Authenticated Data (AAD)* in den GCM-Modus eingebunden, sodass Manipulationen am Header sofort auffallen.
-
-* **Länge des Dateinamens (`NAME_LEN_SIZE`):**
-* *Größe:* 4 Bytes (Big-Endian-Integer, `>I`)
-* *Zweck:* Gibt an, wie lang der nachfolgende Dateiname in Bytes ist (maximal erlaubt: 1024 Bytes).
-
-
-* **Originaler Dateiname (`orig_name`):**
-* *Größe:* Variabel (entspricht der im vorherigen Schritt definierten Länge)
-* *Zweck:* Speichert den ursprünglichen Namen der Datei im *verschlüsselten* Zustand, sodass er im Dateisystem von außen nicht im Klartext sichtbar ist.
-
-
-* **Eigentliche Dateidaten:**
-* *Größe:* Variabel (wird in Chunks zu je $1\,\text{MB}$ verarbeitet)
-* *Zweck:* Der eigentliche Inhalt der Quelldatei.
-
-
-
----
-
-### 3. Authentifizierungs-Tag (Footer)
-
-Am absoluten Ende der Datei befindet sich das kryptografische Prüfsiegel.
-
-* **GCM Tag (`TAG_SIZE`):**
-* *Größe:* 16 Bytes
-* *Zweck:* Garantiert die Integrität und Authentizität der gesamten Nachricht (Header, Metadaten und Nutzdaten). Stimmt das Tag beim Entschlüsseln (nach Passworteingabe) nicht überein, wird der Vorgang sofort abgebrochen (Schutz vor Datenmanipulation und falschem Passwort).
-
-
-
----
-
-## 📊 Zusammenfassung der Byte-Struktur
-
-| Bereich | Feld | Größe in Bytes | Beschreibung |
+| Komponente | Größe | Datentyp / Format | Beschreibung |
 | --- | --- | --- | --- |
-| **Header** | Magic Bytes | 9 | `AESCRYPT2` |
-|  | Version | 1 | Version `3` |
-|  | Salt | 16 | Zufälliger Wert für Scrypt |
-|  | Nonce | 12 | Initialisierungsvektor für AES-GCM |
-| **Payload** *(Verschlüsselt)* | Name-Länge | 4 | Länge des Dateinamens |
-|  | Dateiname | Variabel | UTF-8 kodierter Originalname |
-|  | Dateidaten | Variabel | Dateiinhalt in $1\,\text{MB}$-Blöcken |
-| **Footer** | GCM Tag | 16 | Authentifizierungs-Prüfsumme |
+| **`MAGIC_V3`** | 9 Bytes | `bytes` (`b"AESCRYPT3"`) | Identifiziert das Dateiformat |
+| **`VERSION`** | 1 Byte | `int` (`1`) | Versionsnummer des Formats |
+| **`SALT`** | 16 Bytes | `bytes` | Zufallswert für die Schlüsselableitung (Scrypt) |
+| **`BASE_NONCE`** | 12 Bytes | `bytes` | Basis-Nonce für AES-GCM |
+| **`CHUNK_SIZE`** | 4 Bytes | Big-Endian Unsigned Int (`>I`) | Größe der einzelnen Chunks (Standard: 1 MB) |
+| **`FILE_SIZE`** | 8 Bytes | Big-Endian Unsigned Long (`>Q`) | Exakte Dateigröße der Originaldatei |
+| **`CHUNK_COUNT`** | 8 Bytes | Big-Endian Unsigned Long (`>Q`) | Gesamtzahl der erwarteten Daten-Chunks |
+
+---
+
+#### Struktur der Chunks ab dem Header:
+
+Jeder Chunk (inklusive **Chunk 0** für Metadaten) ist nach diesem Schema aufgebaut:
+
+| Teil | Größe | Beschreibung |
+| --- | --- | --- |
+| **Chunk Index** | 8 Bytes (`>Q`) | Laufende Nummer des Chunks (0 = Metadaten, 1+ = Dateidaten) |
+| **Plaintext Size** | 4 Bytes (`>I`) | Größe der unverschlüsselten Daten im Chunk |
+| **Ciphertext Size** | 4 Bytes (`>I`) | Größe der verschlüsselten Daten (entspricht meist der Plaintext Size) |
+| **Ciphertext** | Variabel | Die eigentlichen verschlüsselten Daten |
+| **Auth Tag** | 16 Bytes | AES-GCM Authentifizierungs-Tag zur Integritätsprüfung |
+
+> **Besonderheit Chunk 0:** Der entschlüsselte Inhalt von Chunk 0 enthält den Original-Dateinamen:
+> * *Länge des Namens* (4 Bytes) + *Name als UTF-8-String* (variabel).
+> 
+> 
+
+---
+
+### 2. AESCRYPT2-Format (Legacy / Abwärtskompatibilität)
+
+Das ältere Format speichert alle Daten in einem Block mit einem Auth-Tag am Ende.
+
+| Komponente | Größe | Beschreibung |
+| --- | --- | --- |
+| **`MAGIC`** | 9 Bytes | Identifiziert das Format (`b"AESCRYPT2"`) |
+| **`VERSION`** | 1 Byte | Versionsnummer (`3`) |
+| **`SALT`** | 16 Bytes | Zufallswert für Scrypt |
+| **`NONCE`** | 12 Bytes | Nonce für AES-GCM |
+| **`Ciphertext`** | Variabel | Verschlüsselter Inhalt (enthält am Anfang den Dateinamen + Längenpräfix, danach die eigentlichen Datei-Daten) |
+| **`Auth Tag`** | 16 Bytes | Befindet sich am **Ende** der Datei zur Integritätsprüfung |
