@@ -1,4 +1,4 @@
-name: Build Python application 
+name: Build Python application
 
 on:
   workflow_dispatch:
@@ -13,6 +13,10 @@ permissions:
   contents: write
 
 jobs:
+
+  # ============================================================
+  # Linux Build
+  # ============================================================
   build-linux:
     name: Build Linux
     runs-on: ubuntu-latest
@@ -33,6 +37,17 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller==6.22.3
 
+      - name: Verify icon
+        shell: bash
+        run: |
+          if [[ ! -f "aescrypto.ico" ]]; then
+            echo "ERROR: aescrypto.ico wurde im Repository-Root nicht gefunden."
+            exit 1
+          fi
+
+          echo "Icon gefunden:"
+          ls -lh aescrypto.ico
+
       - name: Build with PyInstaller
         run: |
           pyinstaller \
@@ -40,14 +55,21 @@ jobs:
             --noconfirm \
             --onefile \
             --windowed \
-            --icon=aescrypto.ico \
+            --icon="$PWD/aescrypto.ico" \
             --collect-all tkinterdnd2 \
             --hidden-import=pystray.win32 \
             --name aescrypto \
             main.py
 
-      - name: Show Linux executable size
+      - name: Verify Linux executable
+        shell: bash
         run: |
+          if [[ ! -f "dist/aescrypto" ]]; then
+            echo "ERROR: Linux executable wurde nicht erzeugt."
+            exit 1
+          fi
+
+          echo "Linux executable:"
           ls -lh dist/aescrypto
           du -h dist/aescrypto
 
@@ -58,6 +80,10 @@ jobs:
           path: dist/aescrypto
           if-no-files-found: error
 
+
+  # ============================================================
+  # Windows Build
+  # ============================================================
   build-windows:
     name: Build Windows
     runs-on: windows-latest
@@ -73,30 +99,74 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller==6.22.3
 
+      # ----------------------------------------------------------
+      # Prüfen, ob das Icon wirklich im Repository-Root liegt
+      # ----------------------------------------------------------
+      - name: Verify icon
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "aescrypto.ico")) {
+            Write-Error "ERROR: aescrypto.ico wurde im Repository-Root nicht gefunden."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "Icon gefunden"
+          Write-Host "========================================"
+
+          Get-Item "aescrypto.ico" |
+            Select-Object FullName, Length
+
+          Write-Host ""
+
+      # ----------------------------------------------------------
+      # PyInstaller Build
+      # ----------------------------------------------------------
       - name: Build with PyInstaller
+        shell: pwsh
         run: |
           pyinstaller `
             --clean `
             --noconfirm `
             --onefile `
             --windowed `
-            --icon=aescrypto.ico `
+            --icon="$PWD\aescrypto.ico" `
             --collect-submodules tkinterdnd2 `
             --hidden-import=pystray._win32 `
             --name aescrypto `
             main.py
 
-      - name: Show Windows executable size
+      # ----------------------------------------------------------
+      # Prüfen, ob die EXE erzeugt wurde
+      # ----------------------------------------------------------
+      - name: Verify Windows executable
         shell: pwsh
         run: |
-          Get-Item "dist\aescrypto.exe" |
-            Select-Object Name, Length
+          if (-not (Test-Path "dist\aescrypto.exe")) {
+            Write-Error "ERROR: aescrypto.exe wurde nicht erzeugt."
+            exit 1
+          }
 
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "Windows executable erfolgreich erzeugt"
+          Write-Host "========================================"
+
+          Get-Item "dist\aescrypto.exe" |
+            Select-Object Name, Length, FullName
+
+          Write-Host ""
+
+      # ----------------------------------------------------------
+      # Artifact hochladen
+      # ----------------------------------------------------------
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
@@ -104,6 +174,10 @@ jobs:
           path: dist/aescrypto.exe
           if-no-files-found: error
 
+
+  # ============================================================
+  # GitHub Release
+  # ============================================================
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
@@ -112,14 +186,24 @@ jobs:
       - build-linux
       - build-windows
 
+    # Release nur erstellen, wenn release_version angegeben wurde.
+    # Der Build selbst muss nicht zwingend auf beiden Plattformen
+    # erfolgreich sein.
     if: |
       always() &&
       inputs.release_version != ''
 
     steps:
+
+      # ----------------------------------------------------------
+      # Repository auschecken
+      # ----------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      # ----------------------------------------------------------
+      # Build-Ergebnisse prüfen
+      # ----------------------------------------------------------
       - name: Check build results
         shell: bash
         run: |
@@ -128,11 +212,15 @@ jobs:
 
           if [[ "${{ needs.build-linux.result }}" != "success" ]] && \
              [[ "${{ needs.build-windows.result }}" != "success" ]]; then
-            echo "Both builds failed."
-            echo "No release will be created."
+            echo ""
+            echo "ERROR: Beide Builds sind fehlgeschlagen."
+            echo "Es wird kein Release erstellt."
             exit 1
           fi
 
+      # ----------------------------------------------------------
+      # Linux Artifact herunterladen
+      # ----------------------------------------------------------
       - name: Download Linux artifact
         if: needs.build-linux.result == 'success'
         uses: actions/download-artifact@v8
@@ -140,6 +228,9 @@ jobs:
           name: aescrypto-linux
           path: release
 
+      # ----------------------------------------------------------
+      # Windows Artifact herunterladen
+      # ----------------------------------------------------------
       - name: Download Windows artifact
         if: needs.build-windows.result == 'success'
         uses: actions/download-artifact@v8
@@ -147,6 +238,9 @@ jobs:
           name: aescrypto-windows
           path: release
 
+      # ----------------------------------------------------------
+      # GitHub Release erstellen / aktualisieren
+      # ----------------------------------------------------------
       - name: Create GitHub Release
         shell: bash
         env:
@@ -159,12 +253,19 @@ jobs:
 
           echo "Release version: $TAG"
 
+          # ------------------------------------------------------
+          # Version prüfen
+          # ------------------------------------------------------
           if [[ "$TAG" != v* && "$TAG" != V* ]]; then
+            echo ""
             echo "ERROR: Release version must start with 'v'."
             echo "Example: v1.0.0"
             exit 1
           fi
 
+          # ------------------------------------------------------
+          # Vorhandene Build-Dateien sammeln
+          # ------------------------------------------------------
           FILES=()
 
           if [[ -f "release/aescrypto" ]]; then
@@ -175,16 +276,27 @@ jobs:
             FILES+=("release/aescrypto.exe")
           fi
 
+          # ------------------------------------------------------
+          # Prüfen, ob mindestens ein Build vorhanden ist
+          # ------------------------------------------------------
           if [[ ${#FILES[@]} -eq 0 ]]; then
+            echo ""
             echo "ERROR: No build artifacts found."
             exit 1
           fi
 
+          echo ""
           echo "Files for release:"
           printf '%s\n' "${FILES[@]}"
 
+          # ------------------------------------------------------
+          # Release existiert bereits?
+          # ------------------------------------------------------
           if gh release view "$TAG" >/dev/null 2>&1; then
+
+            echo ""
             echo "Release $TAG already exists."
+            echo "Uploading new build artifacts..."
 
             gh release upload \
               "$TAG" \
@@ -192,6 +304,8 @@ jobs:
               --clobber
 
           else
+
+            echo ""
             echo "Creating new GitHub Release $TAG..."
 
             gh release create \
@@ -199,6 +313,11 @@ jobs:
               "${FILES[@]}" \
               --title "$TAG" \
               --generate-notes
+
           fi
 
-          echo "Release successfully created/updated: $TAG"
+          echo ""
+          echo "========================================"
+          echo "Release successfully created/updated"
+          echo "Version: $TAG"
+          echo "========================================"
