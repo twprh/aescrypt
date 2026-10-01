@@ -24,8 +24,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, scrolledtext
-    import pystray
-    from pystray import MenuItem as item
+
+    # Unter Linux wird bewusst KEIN Tray-Modul geladen.
+    if not sys.platform.startswith("linux"):
+        import pystray
+        from pystray import MenuItem as item
+
     from PIL import Image, ImageDraw
 
     GUI_AVAILABLE = True
@@ -1050,8 +1054,13 @@ if GUI_AVAILABLE:
             except Exception:
                 self.window_icon = None
 
-            # Schließen-Button: Anwendung ins Tray minimieren
-            self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+            # Schließen-Button:
+            # Unter Linux wird die Anwendung normal beendet.
+            # Auf anderen Systemen bleibt das bisherige Tray-Verhalten erhalten.
+            if sys.platform.startswith("linux"):
+                self.root.protocol("WM_DELETE_WINDOW", self.exit_application)
+            else:
+                self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
 
             # Notebook (Tabs) erstellen
             self.notebook = ttk.Notebook(self.root)
@@ -1067,15 +1076,17 @@ if GUI_AVAILABLE:
             self.notebook.add(self.tab_text, text="Text Verschlüsselung")
             self.setup_text_tab()
 
-            # Tray starten
-            self.start_tray()
+            # Tray nur auf Nicht-Linux-Systemen starten
+            if not sys.platform.startswith("linux"):
+                self.start_tray()
 
         # ====================================================
         # Tray
         # ====================================================
 
         def start_tray(self):
-            if not GUI_AVAILABLE:
+            # Unter Linux niemals einen Tray starten.
+            if not GUI_AVAILABLE or sys.platform.startswith("linux"):
                 return
 
             try:
@@ -1153,6 +1164,11 @@ if GUI_AVAILABLE:
                 pass
 
         def hide_to_tray(self):
+            # Unter Linux gibt es kein Tray.
+            if sys.platform.startswith("linux"):
+                self.exit_application()
+                return
+
             if self.exiting:
                 return
 
