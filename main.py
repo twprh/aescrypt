@@ -1122,57 +1122,109 @@ if GUI_AVAILABLE:
             self.input_text_area.delete("1.0", tk.END)
             self.output_text_area.delete("1.0", tk.END)
 
-
 # ============================================================
 # Main Entry Point (CLI & GUI Support)
 # ============================================================
 
-def main():
-    parser = argparse.ArgumentParser(description="AES Datei- und Text-Verschlüsselungstool")
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        prog="aescrypto-cli",
+        description="AES Datei- und Text-Verschlüsselungstool",
+    )
     parser.add_argument("paths", nargs="*", help="Dateien oder Ordner für die Verarbeitung")
     parser.add_argument("-t", "--text", help="Text der ver- oder entschlüsselt werden soll")
-    parser.add_argument("-d", "--decrypt", action="store_true", help="Entschlüsseln Modus (für Dateien oder Text)")
+    parser.add_argument("-d", "--decrypt", action="store_true", help="Entschlüsseln Modus (für Text)")
     parser.add_argument("--delete", action="store_true", help="Originaldatei nach Verarbeitung löschen")
     parser.add_argument("--enc-name", action="store_true", help="Dateinamen tarnen")
+    parser.add_argument("--version", action="version", version=f"AES Crypto Tool {APP_VERSION}")
+    return parser
 
-    args = parser.parse_args()
 
-    # Wenn CLI-Argumente übergeben wurden, Passwort via Pipe (Stdin) oder interaktiv einlesen
-    if args.paths or args.text is not None:
-        if not sys.stdin.isatty():
-            password = sys.stdin.readline().rstrip("\r\n")
-        else:
-            password = getpass.getpass("Passwort: ")
+def _stdin_is_interactive():
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        return False
 
-        if args.text is not None:
-            try:
-                if args.decrypt:
-                    result = decrypt_text(args.text, password)
-                else:
-                    result = encrypt_text(args.text, password)
-                print(result)
-            except Exception as e:
-                print(f"Fehler: {e}", file=sys.stderr)
-                sys.exit(1)
-        else:
-            files = collect_files(args.paths)
-            for f in files:
-                success, msg = process_single(f, password, args.delete, args.enc_name)
-                print(msg)
-    else:
-        # Andernfalls GUI starten
-        if GUI_AVAILABLE:
-            if DND_AVAILABLE:
-                root = TkinterDnD.Tk()
+
+def read_cli_password():
+    if _stdin_is_interactive():
+        return getpass.getpass("Passwort: ")
+    if sys.stdin is None:
+        raise RuntimeError("Kein Passwort verfügbar (keine Konsoleneingabe möglich).")
+    line = sys.stdin.readline()
+    if not line:
+        raise RuntimeError("Kein Passwort über stdin erhalten.")
+    return line.rstrip("\r\n")
+
+
+def run_cli(argv=None):
+    """Reiner CLI-Einstiegspunkt für aes_cli.py (Konsolen-Build).
+    Startet niemals die GUI und liefert einen Exit-Code zurück."""
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if not args.paths and args.text is None:
+        parser.print_help()
+        return 2
+
+    try:
+        password = read_cli_password()
+    except Exception as e:
+        print(f"Fehler: {e}", file=sys.stderr)
+        return 1
+
+    if not password:
+        print("Fehler: Passwort darf nicht leer sein.", file=sys.stderr)
+        return 1
+
+    if args.text is not None:
+        try:
+            if args.decrypt:
+                result = decrypt_text(args.text, password)
             else:
-                root = tk.Tk()
-            
-            app = AESCryptoApp(root)
-            root.mainloop()
+                result = encrypt_text(args.text, password)
+        except Exception as e:
+            print(f"Fehler: {e}", file=sys.stderr)
+            return 1
+        print(result)
+        return 0
+
+    files = collect_files(args.paths)
+    if not files:
+        print("Fehler: Keine passenden Dateien gefunden.", file=sys.stderr)
+        return 1
+
+    failed = 0
+    for f in files:
+        success, msg = process_single(f, password, args.delete, args.enc_name)
+        if success:
+            print(msg)
         else:
-            print("Keine Argumente angegeben und GUI (Tkinter) nicht verfügbar.")
-            sys.exit(1)
+            failed += 1
+            print(msg, file=sys.stderr)
+
+    return 1 if failed else 0
+
+
+def run_gui():
+    """GUI-Einstiegspunkt für den --windowed Build."""
+    if not GUI_AVAILABLE:
+        return 1
+    root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
+    AESCryptoApp(root)
+    root.mainloop()
+    return 0
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv:
+        return run_cli(argv)
+    return run_gui()
 
 
 if __name__ == "__main__":
-    main()
+    multiprocessing.freeze_support()
+    raise SystemExit(main())
