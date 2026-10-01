@@ -1014,17 +1014,87 @@ def create_shield_icon(size=64):
 
 
 # ============================================================
-# Fenster-Icon
+# Windows Fenster-Icon
 # ============================================================
 
 def get_app_icon_path():
-    """Pfad zum aescrypto.ico ermitteln – auch bei PyInstaller-Builds."""
+    """Pfad zu aescrypto.ico ermitteln – auch bei PyInstaller-Builds."""
     if getattr(sys, "frozen", False):
-        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        base_dir = getattr(
+            sys,
+            "_MEIPASS",
+            os.path.dirname(sys.executable)
+        )
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
 
     return os.path.join(base_dir, "aescrypto.ico")
+
+
+def set_windows_window_icon(root):
+    """Setzt das native Windows-Titelleisten-Icon über die Win32-API."""
+    if not sys.platform.startswith("win"):
+        return
+
+    icon_path = get_app_icon_path()
+
+    if not os.path.isfile(icon_path):
+        return
+
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+
+        hwnd = root.winfo_id()
+
+        IMAGE_ICON = 1
+        LR_LOADFROMFILE = 0x00000010
+
+        ICON_SMALL = 0
+        ICON_BIG = 1
+        WM_SETICON = 0x0080
+
+        hicon_big = user32.LoadImageW(
+            None,
+            icon_path,
+            IMAGE_ICON,
+            32,
+            32,
+            LR_LOADFROMFILE
+        )
+
+        hicon_small = user32.LoadImageW(
+            None,
+            icon_path,
+            IMAGE_ICON,
+            16,
+            16,
+            LR_LOADFROMFILE
+        )
+
+        if hicon_big:
+            user32.SendMessageW(
+                hwnd,
+                WM_SETICON,
+                ICON_BIG,
+                hicon_big
+            )
+
+        if hicon_small:
+            user32.SendMessageW(
+                hwnd,
+                WM_SETICON,
+                ICON_SMALL,
+                hicon_small
+            )
+
+        # Handles am Root-Fenster halten.
+        root._aescrypto_hicon_big = hicon_big
+        root._aescrypto_hicon_small = hicon_small
+
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -1049,22 +1119,22 @@ if GUI_AVAILABLE:
             # Fenster-Icon
             try:
                 self.window_icon = None
-                icon_path = get_app_icon_path()
 
-                if os.path.isfile(icon_path):
-                    if sys.platform.startswith("win"):
-                        # Windows-Titelleiste: echtes .ico verwenden
-                        self.root.iconbitmap(icon_path)
-                    else:
-                        # Auf Linux/macOS .ico über Pillow als Tk-Bild laden
+                if sys.platform.startswith("win"):
+                    # Native Windows-Titelleiste direkt über Win32 setzen.
+                    set_windows_window_icon(self.root)
+
+                else:
+                    icon_path = get_app_icon_path()
+
+                    if os.path.isfile(icon_path):
                         from PIL import ImageTk
                         icon_image = Image.open(icon_path)
                         self.window_icon = ImageTk.PhotoImage(icon_image)
                         self.root.iconphoto(False, self.window_icon)
-                else:
-                    # Fallback, falls aescrypto.ico nicht vorhanden ist
-                    self.window_icon = create_shield_icon(64)
-                    self.root.iconphoto(False, self.window_icon)
+                    else:
+                        self.window_icon = create_shield_icon(64)
+                        self.root.iconphoto(False, self.window_icon)
 
             except Exception:
                 self.window_icon = None
