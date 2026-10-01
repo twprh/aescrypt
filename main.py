@@ -62,7 +62,7 @@ FORMAT_VERSION = 3
 MAGIC_V3 = b"AESCRYPT3"
 FORMAT_VERSION_V3 = 1
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -466,12 +466,9 @@ def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
         salt, base_nonce, chunk_size, file_size, data_chunk_count, header = read_v3_header(fin)
 
         if chunk_size != CHUNK_SIZE:
-            # Andere gültige AESCRYPT3-Chunkgrößen dürfen gelesen werden;
-            # sie müssen nur innerhalb der Formatgrenzen liegen.
             if chunk_size <= 0 or chunk_size > MAX_V3_CHUNK_SIZE:
                 raise ValueError("Ungültige AESCRYPT3-Chunk-Größe.")
 
-        # Ein Minimalcheck verhindert offensichtlich abgeschnittene Dateien.
         minimum_size = len(header) + V3_RECORD_HEADER_SIZE + TAG_SIZE
         if fsize < minimum_size:
             raise ValueError("AESCRYPT3-Datei zu klein oder beschädigt.")
@@ -486,8 +483,6 @@ def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
 
         try:
             with os.fdopen(tmp_fd, "wb") as fout:
-                # Chunk 0: Dateiname/Metadaten. Er muss vor dem ersten Datenchunk
-                # vollständig und authentisch sein.
                 first = read_v3_chunk(fin)
                 if first is None:
                     raise ValueError("AESCRYPT3-Datei enthält keine Metadaten.")
@@ -547,7 +542,6 @@ def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
                 if bytes_written != file_size:
                     raise ValueError("AESCRYPT3-Dateigröße stimmt nicht mit dem Header überein.")
 
-                # Nach dem erwarteten letzten Chunk darf nichts mehr folgen.
                 trailing = fin.read(1)
                 if trailing:
                     raise ValueError("AESCRYPT3-Datei enthält unerwartete zusätzliche Daten.")
@@ -555,8 +549,6 @@ def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
                 fout.flush()
                 os.fsync(fout.fileno())
 
-            # Erst nach erfolgreicher Authentifizierung und vollständiger
-            # Strukturprüfung wird die temporäre Klartextdatei sichtbar installiert.
             install_temp_no_overwrite(tmp_path, output_path)
             tmp_path = None
             return output_path
@@ -603,8 +595,6 @@ def decrypt_file_v2(input_path, output_path, password, progress_cb=None):
             decryptor = cipher.decryptor()
             decryptor.authenticate_additional_data(header)
 
-            # Legacy-Dateien werden vollständig in RAM authentifiziert, bevor
-            # überhaupt eine Klartext-Ausgabedatei angelegt wird.
             fin.seek(len(header))
             plaintext = bytearray()
             remaining = ciphertext_size
@@ -709,8 +699,6 @@ def get_original_filename(enc_path, password):
                 raise ValueError("Ungültiger Dateiname.")
 
     if magic == MAGIC:
-        # Für AESCRYPT2 wird die vollständige Datei authentifiziert, bevor
-        # der Dateiname zurückgegeben wird. Das entspricht dem Legacy-Format.
         fsize = os.path.getsize(enc_path)
         header_size = len(MAGIC) + 1 + SALT_SIZE + NONCE_SIZE
         if fsize < header_size + NAME_LEN_SIZE + 1 + TAG_SIZE:
@@ -853,6 +841,179 @@ def process_single(fpath, password, delete_original, encrypt_filename=False):
 
 
 # ============================================================
+# Tray Icon
+# ============================================================
+
+def create_shield_icon(size=64):
+    img = Image.new(
+        "RGBA",
+        (
+            size,
+            size,
+        ),
+        (
+            0,
+            0,
+            0,
+            0,
+        ),
+    )
+
+    d = ImageDraw.Draw(img)
+
+    def i(v):
+        return int(round(v))
+
+    m = size * 0.1
+
+    shield = [
+        (
+            m,
+            m * 1.2,
+        ),
+        (
+            size - m,
+            m * 1.2,
+        ),
+        (
+            size - m * 0.7,
+            size * 0.38,
+        ),
+        (
+            size / 2,
+            size - m * 1.4,
+        ),
+        (
+            m * 0.7,
+            size * 0.38,
+        ),
+    ]
+
+    d.polygon(
+        [
+            (
+                i(x),
+                i(y),
+            )
+            for x, y in shield
+        ],
+        fill="#0B132B",
+        outline="#1C2541",
+        width=max(1, i(size * 0.025)),
+    )
+
+    im = m * 1.5
+
+    inner = [
+        (
+            m + im * 0.8,
+            m * 1.2 + im * 0.8,
+        ),
+        (
+            size - m - im * 0.8,
+            m * 1.2 + im * 0.8,
+        ),
+        (
+            size - m * 0.7 - im * 0.5,
+            size * 0.38 + im * 0.4,
+        ),
+        (
+            size / 2,
+            size - m * 1.4 - im * 1.1,
+        ),
+        (
+            m * 0.7 + im * 0.5,
+            size * 0.38 + im * 0.4,
+        ),
+    ]
+
+    d.polygon(
+        [
+            (
+                i(x),
+                i(y),
+            )
+            for x, y in inner
+        ],
+        fill="#3A506B",
+    )
+
+    lw = size * 0.26
+    lh = size * 0.20
+
+    lx = size / 2 - lw / 2
+    ly = size * 0.44
+
+    d.rectangle(
+        [
+            i(lx),
+            i(ly),
+            i(lx + lw),
+            i(ly + lh),
+        ],
+        fill="#E0E0E0",
+    )
+
+    sr = size * 0.07
+
+    d.arc(
+        [
+            i(lx + lw * 0.25),
+            i(ly - sr * 1.8),
+            i(lx + lw * 0.75),
+            i(ly),
+        ],
+        start=180,
+        end=0,
+        fill="#E0E0E0",
+        width=max(
+            1,
+            i(size * 0.06),
+        ),
+    )
+
+    kh = size * 0.02
+
+    d.ellipse(
+        [
+            i(size / 2 - kh),
+            i(ly + lh * 0.3),
+            i(size / 2 + kh),
+            i(ly + lh * 0.3 + kh * 2),
+        ],
+        fill="#0B132B",
+    )
+
+    keyhole = [
+        (
+            size / 2 - kh * 0.9,
+            ly + lh * 0.5,
+        ),
+        (
+            size / 2 + kh * 0.9,
+            ly + lh * 0.5,
+        ),
+        (
+            size / 2,
+            ly + lh * 0.8,
+        ),
+    ]
+
+    d.polygon(
+        [
+            (
+                i(x),
+                i(y),
+            )
+            for x, y in keyhole
+        ],
+        fill="#0B132B",
+    )
+
+    return img
+
+
+# ============================================================
 # Grafische Benutzeroberfläche (GUI)
 # ============================================================
 
@@ -864,7 +1025,23 @@ if GUI_AVAILABLE:
             self.root = root
             self.root.title(f"AES Crypto Tool v{APP_VERSION}")
             self.root.geometry("700x580")
-            
+
+            # Tray-Status
+            self.tray_icon = None
+            self.tray_thread = None
+            self.tray_ready = threading.Event()
+            self.exiting = False
+
+            # Fenster-Icon
+            try:
+                self.window_icon = create_shield_icon(64)
+                self.root.iconphoto(False, self.window_icon)
+            except Exception:
+                self.window_icon = None
+
+            # Schließen-Button: Anwendung ins Tray minimieren
+            self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+
             # Notebook (Tabs) erstellen
             self.notebook = ttk.Notebook(self.root)
             self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
@@ -878,6 +1055,127 @@ if GUI_AVAILABLE:
             self.tab_text = ttk.Frame(self.notebook)
             self.notebook.add(self.tab_text, text="Text Verschlüsselung")
             self.setup_text_tab()
+
+            # Tray starten
+            self.start_tray()
+
+        # ====================================================
+        # Tray
+        # ====================================================
+
+        def start_tray(self):
+            if not GUI_AVAILABLE:
+                return
+
+            try:
+                icon_image = create_shield_icon(64)
+
+                menu = pystray.Menu(
+                    item(
+                        f"AES Crypto Tool v{APP_VERSION}",
+                        self.tray_show,
+                        default=True,
+                    ),
+                    pystray.Menu.SEPARATOR,
+                    item(
+                        "Anzeigen",
+                        self.tray_show,
+                    ),
+                    item(
+                        "Beenden",
+                        self.tray_exit,
+                    ),
+                )
+
+                self.tray_icon = pystray.Icon(
+                    "AESCryptoTool",
+                    icon_image,
+                    f"AES Crypto Tool v{APP_VERSION}",
+                    menu,
+                )
+
+                self.tray_thread = threading.Thread(
+                    target=self._run_tray,
+                    name="AESCryptoTray",
+                    daemon=True,
+                )
+                self.tray_thread.start()
+
+            except Exception as e:
+                self.tray_icon = None
+                self.tray_thread = None
+                try:
+                    print(f"Tray konnte nicht gestartet werden: {e}", file=sys.stderr)
+                except Exception:
+                    pass
+
+        def _run_tray(self):
+            try:
+                self.tray_ready.set()
+                self.tray_icon.run()
+            except Exception as e:
+                try:
+                    print(f"Tray-Fehler: {e}", file=sys.stderr)
+                except Exception:
+                    pass
+
+        def tray_show(self, icon=None, menu_item=None):
+            try:
+                self.root.after(0, self._show_window)
+            except Exception:
+                pass
+
+        def _show_window(self):
+            if self.exiting:
+                return
+
+            try:
+                self.root.deiconify()
+                self.root.lift()
+                self.root.attributes("-topmost", True)
+                self.root.after(
+                    100,
+                    lambda: self.root.attributes("-topmost", False)
+                )
+                self.root.focus_force()
+            except Exception:
+                pass
+
+        def hide_to_tray(self):
+            if self.exiting:
+                return
+
+            try:
+                self.root.withdraw()
+            except Exception:
+                pass
+
+        def tray_exit(self, icon=None, menu_item=None):
+            try:
+                self.root.after(0, self.exit_application)
+            except Exception:
+                self.exit_application()
+
+        def exit_application(self):
+            if self.exiting:
+                return
+
+            self.exiting = True
+
+            try:
+                if self.tray_icon is not None:
+                    self.tray_icon.stop()
+            except Exception:
+                pass
+
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+
+        # ====================================================
+        # Dateien / Ordner
+        # ====================================================
 
         def setup_files_tab(self):
             info_label = ttk.Label(self.tab_files, text="Wähle Dateien/Ordner aus oder ziehe sie per Drag & Drop hierher:", padding=10)
@@ -990,6 +1288,10 @@ if GUI_AVAILABLE:
                 messagebox.showwarning("Fertig mit Hinweisen", f"Erfolgreich: {success_count}\nFehler:\n" + "\n".join(error_msgs))
             else:
                 messagebox.showinfo("Erfolg", f"Alle {success_count} Elemente wurden erfolgreich verarbeitet!")
+
+        # ====================================================
+        # Text-Verschlüsselung
+        # ====================================================
 
         def setup_text_tab(self):
             pwd_frame = ttk.LabelFrame(self.tab_text, text="Passwort", padding=10)
@@ -1121,6 +1423,7 @@ if GUI_AVAILABLE:
             self.text_pwd_entry.delete(0, tk.END)
             self.input_text_area.delete("1.0", tk.END)
             self.output_text_area.delete("1.0", tk.END)
+
 
 # ============================================================
 # Main Entry Point (CLI & GUI Support)
