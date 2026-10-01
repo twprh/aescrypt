@@ -12,6 +12,7 @@ import multiprocessing
 import getpass
 import io
 import tempfile
+import base64
 
 # Linux GUI: Single-Instance-Sperre
 if sys.platform.startswith("linux"):
@@ -53,10 +54,15 @@ from cryptography.exceptions import InvalidTag
 
 CHUNK_SIZE = 1024 * 1024
 
+# AESCRYPT2 bleibt als Legacy-Format für bestehende Dateien erhalten.
 MAGIC = b"AESCRYPT2"
 FORMAT_VERSION = 3
 
-APP_VERSION = "1.2.3"
+# Neues chunk-basiertes Dateiformat.
+MAGIC_V3 = b"AESCRYPT3"
+FORMAT_VERSION_V3 = 1
+
+APP_VERSION = "1.2.0"
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -65,6 +71,13 @@ TAG_SIZE = 16
 NAME_LEN_SIZE = 4
 MAX_NAME_LEN = 1024
 
+# AESCRYPT3 Header-Felder
+V3_CHUNK_SIZE_SIZE = 4
+V3_FILE_SIZE_SIZE = 8
+V3_CHUNK_COUNT_SIZE = 8
+V3_RECORD_HEADER_SIZE = 8 + 4 + 4
+MAX_V3_CHUNK_SIZE = 64 * 1024 * 1024
+
 # Scrypt ist speicherhart und erschwert Offline-Passwortangriffe.
 SCRYPT_N = 2**16
 SCRYPT_R = 8
@@ -72,17 +85,14 @@ SCRYPT_P = 1
 
 
 # ============================================================
-# Kryptographie
+# Kryptographie (Grundlagen)
 # ============================================================
 
 def derive_key(password: str, salt: bytes) -> bytes:
-
     if not isinstance(password, str):
         raise TypeError("Passwort muss ein String sein.")
-
     if not password:
         raise ValueError("Passwort darf nicht leer sein.")
-
     if len(salt) != SALT_SIZE:
         raise ValueError("Ungültige Salt-Länge.")
 
@@ -93,20 +103,16 @@ def derive_key(password: str, salt: bytes) -> bytes:
         r=SCRYPT_R,
         p=SCRYPT_P,
     )
-
     return kdf.derive(password.encode("utf-8"))
 
 
 def build_header(salt: bytes, nonce: bytes) -> bytes:
-
+    """AESCRYPT2-Header. Wird auch für die Textfunktion verwendet."""
     if len(salt) != SALT_SIZE:
         raise ValueError("Ungültige Salt-Länge.")
-
     if len(nonce) != NONCE_SIZE:
         raise ValueError("Ungültige Nonce-Länge.")
 
-    # Der Dateiname steht NICHT im Klartext im Header.
-    # Er wird als erster Teil der GCM-Nutzdaten verschlüsselt.
     return (
         MAGIC
         + bytes([FORMAT_VERSION])
@@ -116,3554 +122,1109 @@ def build_header(salt: bytes, nonce: bytes) -> bytes:
 
 
 def read_header(fin):
-
+    """AESCRYPT2-Header lesen."""
     magic = fin.read(len(MAGIC))
-
     if magic != MAGIC:
-        raise ValueError(
-            "Ungültiges oder nicht unterstütztes Dateiformat."
-        )
+        raise ValueError("Ungültiges oder nicht unterstütztes Dateiformat.")
 
     version = fin.read(1)
-
     if len(version) != 1 or version[0] != FORMAT_VERSION:
-        raise ValueError(
-            "Nicht unterstützte Dateiformat-Version."
-        )
+        raise ValueError("Nicht unterstützte Dateiformat-Version.")
 
     salt = fin.read(SALT_SIZE)
-
     if len(salt) != SALT_SIZE:
-        raise ValueError(
-            "Header unvollständig."
-        )
+        raise ValueError("Header unvollständig.")
 
     nonce = fin.read(NONCE_SIZE)
-
     if len(nonce) != NONCE_SIZE:
-        raise ValueError(
-            "Header unvollständig."
-        )
+        raise ValueError("Header unvollständig.")
 
-    header = (
-        MAGIC
-        + version
-        + salt
-        + nonce
-    )
-
+    header = MAGIC + version + salt + nonce
     return salt, nonce, header
 
 
-def install_temp_no_overwrite(tmp_path, output_path):
-    """
-    Installiert eine fertige Datei atomar, ohne ein vorhandenes
-    Ziel zu überschreiben.
+def build_v3_header(salt: bytes, base_nonce: bytes, file_size: int, data_chunk_count: int) -> bytes:
+    """AESCRYPT3 Header. Enthält Größe und erwartete Chunk-Anzahl,
+    damit Trunkierung/Entfernung von Chunks erkannt wird."""
+    if len(salt) != SALT_SIZE:
+        raise ValueError("Ungültige Salt-Länge.")
+    if len(base_nonce) != NONCE_SIZE:
+        raise ValueError("Ungültige Nonce-Länge.")
+    if not 0 <= file_size <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("Datei ist zu groß für das AESCRYPT3-Format.")
+    if not 0 <= data_chunk_count <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("Zu viele Chunks.")
 
-    WICHTIG (Bugfix):
-    Die ursprüngliche Implementierung nutzte os.link() (Hardlink),
-    um die temporäre Datei "an die Zielposition zu klonen".
-    Hardlinks werden jedoch von vielen Dateisystemen, die auf
-    externen Datenträgern (USB-Sticks, SD-Karten etc.) verwendet
-    werden - allen voran FAT32 und exFAT - NICHT unterstützt.
-    os.link() schlug dort mit einem OSError fehl, obwohl die Ver-/
-    Entschlüsselung selbst bereits erfolgreich und vollständig
-    abgeschlossen war. Die fertige Datei wurde dadurch verworfen.
+    return (
+        MAGIC_V3
+        + bytes([FORMAT_VERSION_V3])
+        + salt
+        + base_nonce
+        + struct.pack(">I", CHUNK_SIZE)
+        + struct.pack(">Q", file_size)
+        + struct.pack(">Q", data_chunk_count)
+    )
 
-    Die neue Implementierung verwendet stattdessen:
 
-      1. os.open(..., O_CREAT | O_EXCL)
-         -> atomares, exklusives Anlegen der Zieldatei
-            (auf so gut wie jedem Dateisystem unterstützt,
-             inkl. FAT32/exFAT/NTFS/ext4/...).
-            Existiert die Datei bereits, schlägt dies mit
-            FileExistsError fehl - Race-Conditions werden
-            damit weiterhin sicher verhindert.
+def read_v3_header(fin):
+    magic = fin.read(len(MAGIC_V3))
+    if magic != MAGIC_V3:
+        raise ValueError("Ungültiges oder nicht unterstütztes AESCRYPT3-Format.")
 
-      2. os.replace(tmp_path, output_path)
-         -> überschreibt die (leere) reservierte Datei mit dem
-            fertigen Inhalt. Da sich tmp_path und output_path im
-            selben Verzeichnis (und damit auf demselben
-            Dateisystem) befinden, ist dies atomar und
-            funktioniert plattform- und dateisystemübergreifend.
-    """
+    version = fin.read(1)
+    if len(version) != 1 or version[0] != FORMAT_VERSION_V3:
+        raise ValueError("Nicht unterstützte AESCRYPT3-Version.")
 
+    salt = fin.read(SALT_SIZE)
+    base_nonce = fin.read(NONCE_SIZE)
+    chunk_size_raw = fin.read(V3_CHUNK_SIZE_SIZE)
+    file_size_raw = fin.read(V3_FILE_SIZE_SIZE)
+    chunk_count_raw = fin.read(V3_CHUNK_COUNT_SIZE)
+
+    if (len(salt) != SALT_SIZE or len(base_nonce) != NONCE_SIZE or
+            len(chunk_size_raw) != V3_CHUNK_SIZE_SIZE or
+            len(file_size_raw) != V3_FILE_SIZE_SIZE or
+            len(chunk_count_raw) != V3_CHUNK_COUNT_SIZE):
+        raise ValueError("AESCRYPT3-Header unvollständig.")
+
+    chunk_size = struct.unpack(">I", chunk_size_raw)[0]
+    file_size = struct.unpack(">Q", file_size_raw)[0]
+    data_chunk_count = struct.unpack(">Q", chunk_count_raw)[0]
+
+    if chunk_size == 0 or chunk_size > MAX_V3_CHUNK_SIZE:
+        raise ValueError("Ungültige AESCRYPT3-Chunk-Größe.")
+
+    expected_count = (file_size + chunk_size - 1) // chunk_size if file_size else 0
+    if data_chunk_count != expected_count:
+        raise ValueError("Ungültige AESCRYPT3-Chunk-Anzahl.")
+
+    header = (
+        MAGIC_V3
+        + version
+        + salt
+        + base_nonce
+        + chunk_size_raw
+        + file_size_raw
+        + chunk_count_raw
+    )
+
+    return salt, base_nonce, chunk_size, file_size, data_chunk_count, header
+
+
+def build_v3_nonce(base_nonce: bytes, chunk_index: int) -> bytes:
+    if len(base_nonce) != NONCE_SIZE:
+        raise ValueError("Ungültige Nonce-Länge.")
+    if not 0 <= chunk_index <= 0xFFFFFFFF:
+        raise ValueError("Zu viele Chunks für AES-GCM-Nonce.")
+    return base_nonce[:8] + chunk_index.to_bytes(4, "big")
+
+
+def build_v3_aad(header: bytes, chunk_index: int, plaintext_size: int) -> bytes:
+    if not 0 <= chunk_index <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("Ungültiger Chunk-Index.")
+    if not 0 <= plaintext_size <= 0xFFFFFFFF:
+        raise ValueError("Chunk ist zu groß.")
+    return header + struct.pack(">Q", chunk_index) + struct.pack(">I", plaintext_size)
+
+
+def encrypt_v3_chunk(aes_key: bytes, base_nonce: bytes, header: bytes, chunk_index: int, plaintext: bytes):
+    nonce = build_v3_nonce(base_nonce, chunk_index)
+    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce))
+    encryptor = cipher.encryptor()
+    encryptor.authenticate_additional_data(
+        build_v3_aad(header, chunk_index, len(plaintext))
+    )
+    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+    return ciphertext, encryptor.tag
+
+
+def decrypt_v3_chunk(aes_key: bytes, base_nonce: bytes, header: bytes, chunk_index: int, plaintext_size: int, ciphertext: bytes, tag: bytes):
+    if len(ciphertext) != plaintext_size:
+        raise ValueError("Ungültige Chunk-Größe.")
+    if len(tag) != TAG_SIZE:
+        raise ValueError("Authentifizierungs-Tag fehlt oder ist ungültig.")
+
+    nonce = build_v3_nonce(base_nonce, chunk_index)
+    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
+    decryptor = cipher.decryptor()
+    decryptor.authenticate_additional_data(
+        build_v3_aad(header, chunk_index, plaintext_size)
+    )
     try:
+        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    except InvalidTag:
+        raise ValueError("Falsches Passwort oder beschädigter AESCRYPT3-Chunk.")
 
+    if len(plaintext) != plaintext_size:
+        raise ValueError("Entschlüsselter Chunk hat eine ungültige Größe.")
+    return plaintext
+
+
+def write_v3_chunk(fout, aes_key, base_nonce, header, chunk_index, plaintext):
+    ciphertext, tag = encrypt_v3_chunk(
+        aes_key, base_nonce, header, chunk_index, plaintext
+    )
+    fout.write(struct.pack(">Q", chunk_index))
+    fout.write(struct.pack(">I", len(plaintext)))
+    fout.write(struct.pack(">I", len(ciphertext)))
+    fout.write(ciphertext)
+    fout.write(tag)
+
+
+def read_v3_chunk(fin):
+    record_header = fin.read(V3_RECORD_HEADER_SIZE)
+    if not record_header:
+        return None
+    if len(record_header) != V3_RECORD_HEADER_SIZE:
+        raise ValueError("AESCRYPT3-Chunk-Header ist unvollständig.")
+
+    chunk_index, plaintext_size, ciphertext_size = struct.unpack(
+        ">QII", record_header
+    )
+
+    if ciphertext_size != plaintext_size:
+        raise ValueError("Ungültige AESCRYPT3-Chunk-Größe.")
+
+    ciphertext = fin.read(ciphertext_size)
+    if len(ciphertext) != ciphertext_size:
+        raise ValueError("AESCRYPT3-Datei ist unvollständig.")
+
+    tag = fin.read(TAG_SIZE)
+    if len(tag) != TAG_SIZE:
+        raise ValueError("AESCRYPT3-Authentifizierungs-Tag fehlt.")
+
+    return chunk_index, plaintext_size, ciphertext, tag
+
+
+def install_temp_no_overwrite(tmp_path, output_path):
+    try:
         fd = os.open(
             output_path,
             os.O_CREAT | os.O_EXCL | os.O_WRONLY,
         )
-
     except FileExistsError:
-
-        raise FileExistsError(
-            f"Zieldatei existiert bereits: {output_path}"
-        )
-
+        raise FileExistsError(f"Zieldatei existiert bereits: {output_path}")
     except OSError as e:
-
-        raise OSError(
-            f"Zieldatei konnte nicht sicher angelegt werden: {e}"
-        )
-
+        raise OSError(f"Zieldatei konnte nicht sicher angelegt werden: {e}")
     else:
-
         try:
-
             os.close(fd)
-
-            os.replace(
-                tmp_path,
-                output_path,
-            )
-
+            os.replace(tmp_path, output_path)
         except OSError as e:
-
-            # Reservierte (leere) Zieldatei wieder entfernen,
-            # damit kein Datei-Müll zurückbleibt.
             try:
                 os.remove(output_path)
             except OSError:
                 pass
-
-            raise OSError(
-                f"Zieldatei konnte nicht installiert werden: {e}"
-            )
+            raise OSError(f"Zieldatei konnte nicht installiert werden: {e}")
 
 
 # ============================================================
-# Verschlüsselung
+# Text-Verschlüsselung
 # ============================================================
 
-def encrypt_file(
-    input_path,
-    output_path,
-    password,
-    progress_cb=None,
-):
+def encrypt_text(text: str, password: str) -> str:
+    if not isinstance(text, str):
+        raise TypeError("Text muss ein String sein.")
+    
+    salt = secrets.token_bytes(SALT_SIZE)
+    nonce = secrets.token_bytes(NONCE_SIZE)
+    aes_key = derive_key(password, salt)
+    
+    header = build_header(salt, nonce)
+    plaintext_bytes = text.encode("utf-8")
+    
+    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce))
+    encryptor = cipher.encryptor()
+    encryptor.authenticate_additional_data(header)
+    
+    ciphertext = encryptor.update(plaintext_bytes) + encryptor.finalize()
+    tag = encryptor.tag
+    
+    payload = header + ciphertext + tag
+    return base64.b64encode(payload).decode("utf-8")
 
-    input_path = os.path.abspath(
-        input_path
-    )
 
-    output_path = os.path.abspath(
-        output_path
-    )
+def decrypt_text(encoded_payload: str, password: str) -> str:
+    try:
+        payload = base64.b64decode(encoded_payload.encode("utf-8"))
+    except Exception:
+        raise ValueError("Ungültiges Base64-Format.")
+    
+    header_size = len(MAGIC) + 1 + SALT_SIZE + NONCE_SIZE
+    minimum_size = header_size + TAG_SIZE
+    
+    if len(payload) < minimum_size:
+        raise ValueError("Daten zu kurz oder beschädigt.")
+        
+    header = payload[:header_size]
+    salt = header[len(MAGIC) + 1 : len(MAGIC) + 1 + SALT_SIZE]
+    nonce = header[len(MAGIC) + 1 + SALT_SIZE :]
+    
+    tag = payload[-TAG_SIZE:]
+    ciphertext = payload[header_size:-TAG_SIZE]
+    
+    aes_key = derive_key(password, salt)
+    
+    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
+    decryptor = cipher.decryptor()
+    decryptor.authenticate_additional_data(header)
+    
+    try:
+        plaintext_bytes = decryptor.update(ciphertext) + decryptor.finalize()
+    except InvalidTag:
+        raise ValueError("Falsches Passwort oder beschädigte Daten.")
+        
+    return plaintext_bytes.decode("utf-8")
+
+
+# ============================================================
+# Datei-Verschlüsselung & Entschlüsselung
+# ============================================================
+
+def encrypt_file(input_path, output_path, password, progress_cb=None):
+    """Neue Dateien werden ausschließlich als AESCRYPT3 geschrieben."""
+    input_path = os.path.abspath(input_path)
+    output_path = os.path.abspath(output_path)
 
     if input_path == output_path:
+        raise ValueError("Quelle und Ziel dürfen nicht identisch sein.")
 
-        raise ValueError(
-            "Quelle und Ziel dürfen nicht identisch sein."
-        )
+    file_size = os.path.getsize(input_path)
+    data_chunk_count = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE if file_size else 0
 
-    salt = secrets.token_bytes(
-        SALT_SIZE
-    )
+    salt = secrets.token_bytes(SALT_SIZE)
+    base_nonce = secrets.token_bytes(NONCE_SIZE)
+    aes_key = derive_key(password, salt)
 
-    nonce = secrets.token_bytes(
-        NONCE_SIZE
-    )
+    orig_name = os.path.basename(input_path).encode("utf-8")
+    if len(orig_name) == 0 or len(orig_name) > MAX_NAME_LEN:
+        raise ValueError("Dateiname zu lang oder leer.")
 
-    aes_key = derive_key(
-        password,
-        salt,
-    )
+    metadata = struct.pack(">I", len(orig_name)) + orig_name
+    header = build_v3_header(salt, base_nonce, file_size, data_chunk_count)
 
-    orig_name = os.path.basename(
-        input_path
-    ).encode("utf-8")
-
-    if len(orig_name) > MAX_NAME_LEN:
-
-        raise ValueError(
-            "Dateiname zu lang."
-        )
-
-    header = build_header(
-        salt,
-        nonce,
-    )
-
-    # Der Dateiname wird weiterhin verschlüsselt
-    # innerhalb der Datei gespeichert.
-    encrypted_metadata = (
-        struct.pack(
-            ">I",
-            len(orig_name),
-        )
-        + orig_name
-    )
-
-    file_size = os.path.getsize(
-        input_path
-    )
-
-    bytes_read = 0
-
-    out_dir = (
-        os.path.dirname(output_path)
-        or "."
-    )
-
-    os.makedirs(
-        out_dir,
-        exist_ok=True,
-    )
+    out_dir = os.path.dirname(output_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
 
     tmp_fd, tmp_path = tempfile.mkstemp(
-        dir=out_dir,
-        prefix=".aescrypto-",
-        suffix=".tmp",
+        dir=out_dir, prefix=".aescrypto-", suffix=".tmp"
     )
 
     try:
-
-        with open(
-            input_path,
-            "rb",
-        ) as fin, os.fdopen(
-            tmp_fd,
-            "wb",
-        ) as fout:
-
-            fout.write(
-                header
-            )
-
-            cipher = Cipher(
-                algorithms.AES(aes_key),
-                modes.GCM(nonce),
-            )
-
-            encryptor = cipher.encryptor()
-
-            encryptor.authenticate_additional_data(
-                header
-            )
-
-            encrypted_metadata = encryptor.update(
-                encrypted_metadata
-            )
-
-            if encrypted_metadata:
-
-                fout.write(
-                    encrypted_metadata
-                )
-
-            while True:
-
-                chunk = fin.read(
-                    CHUNK_SIZE
-                )
-
-                if not chunk:
-                    break
-
-                encrypted = encryptor.update(
-                    chunk
-                )
-
-                if encrypted:
-
-                    fout.write(
-                        encrypted
-                    )
-
-                bytes_read += len(
-                    chunk
-                )
-
-                if progress_cb:
-
-                    progress_cb(
-                        bytes_read,
-                        file_size,
-                    )
-
-            final_data = encryptor.finalize()
-
-            if final_data:
-
-                fout.write(
-                    final_data
-                )
-
-            tag = encryptor.tag
-
-            if len(tag) != TAG_SIZE:
-
-                raise ValueError(
-                    "Ungültige GCM-Tag-Länge."
-                )
-
-            fout.write(
-                tag
-            )
-
-            fout.flush()
-
-            os.fsync(
-                fout.fileno()
-            )
-
-        install_temp_no_overwrite(
-            tmp_path,
-            output_path,
-        )
-
-        tmp_path = None
-
-    except Exception:
-
-        if tmp_path:
-
-            try:
-                os.unlink(
-                    tmp_path
-                )
-            except OSError:
-                pass
-
-        raise
-
-
-# ============================================================
-# Entschlüsselung
-# ============================================================
-
-def decrypt_file(
-    input_path,
-    output_path,
-    password,
-    progress_cb=None,
-):
-
-    input_path = os.path.abspath(
-        input_path
-    )
-
-    output_path = os.path.abspath(
-        output_path
-    )
-
-    if input_path == output_path:
-
-        raise ValueError(
-            "Quelle und Ziel dürfen nicht identisch sein."
-        )
-
-    fsize = os.path.getsize(
-        input_path
-    )
-
-    header_size = (
-        len(MAGIC)
-        + 1
-        + SALT_SIZE
-        + NONCE_SIZE
-    )
-
-    minimum_size = (
-        header_size
-        + NAME_LEN_SIZE
-        + 1
-        + TAG_SIZE
-    )
-
-    if fsize < minimum_size:
-
-        raise ValueError(
-            "Datei zu klein oder beschädigt."
-        )
-
-    tmp_path = None
-
-    try:
-
-        with open(
-            input_path,
-            "rb",
-        ) as fin:
-
-            (
-                salt,
-                nonce,
-                header,
-            ) = read_header(fin)
-
-            header_size = len(
-                header
-            )
-
-            if fsize < (
-                header_size
-                + NAME_LEN_SIZE
-                + 1
-                + TAG_SIZE
-            ):
-
-                raise ValueError(
-                    "Ungültige Dateistruktur."
-                )
-
-            fin.seek(
-                fsize - TAG_SIZE
-            )
-
-            tag = fin.read(
-                TAG_SIZE
-            )
-
-            if len(tag) != TAG_SIZE:
-
-                raise ValueError(
-                    "Authentifizierungs-Tag fehlt."
-                )
-
-            ciphertext_size = (
-                fsize
-                - header_size
-                - TAG_SIZE
-            )
-
-            if ciphertext_size < (
-                NAME_LEN_SIZE + 1
-            ):
-
-                raise ValueError(
-                    "Ungültige Dateistruktur."
-                )
-
-            aes_key = derive_key(
-                password,
-                salt,
-            )
-
-            cipher = Cipher(
-                algorithms.AES(aes_key),
-                modes.GCM(
-                    nonce,
-                    tag,
-                ),
-            )
-
-            decryptor = cipher.decryptor()
-
-            decryptor.authenticate_additional_data(
-                header
-            )
-
-            out_dir = (
-                os.path.dirname(output_path)
-                or "."
-            )
-
-            os.makedirs(
-                out_dir,
-                exist_ok=True,
-            )
-
-            tmp_fd, tmp_path = tempfile.mkstemp(
-                dir=out_dir,
-                prefix=".aescrypto-",
-                suffix=".tmp",
+        with open(input_path, "rb") as fin, os.fdopen(tmp_fd, "wb") as fout:
+            fout.write(header)
+
+            # Chunk 0 enthält ausschließlich die verschlüsselten Dateimetadaten.
+            write_v3_chunk(
+                fout, aes_key, base_nonce, header, 0, metadata
             )
 
             bytes_read = 0
-            metadata = bytearray()
-            metadata_done = False
-            name_len = None
-            name_bytes = None
+            for index in range(1, data_chunk_count + 1):
+                expected = min(CHUNK_SIZE, file_size - bytes_read)
+                chunk = fin.read(expected)
+                if len(chunk) != expected:
+                    raise ValueError("Quelldatei konnte während der Verschlüsselung nicht vollständig gelesen werden.")
 
-            with os.fdopen(
-                tmp_fd,
-                "wb",
-            ) as fout:
-
-                fin.seek(
-                    header_size
+                write_v3_chunk(
+                    fout, aes_key, base_nonce, header, index, chunk
                 )
 
-                while (
-                    bytes_read
-                    < ciphertext_size
-                ):
+                bytes_read += len(chunk)
+                if progress_cb:
+                    progress_cb(bytes_read, file_size)
 
-                    to_read = min(
-                        CHUNK_SIZE,
-                        ciphertext_size
-                        - bytes_read,
-                    )
+            if bytes_read != file_size:
+                raise ValueError("Dateigröße hat sich während der Verschlüsselung geändert.")
 
-                    ct_chunk = fin.read(
-                        to_read
-                    )
+            fout.flush()
+            os.fsync(fout.fileno())
 
-                    if len(ct_chunk) != to_read:
+        install_temp_no_overwrite(tmp_path, output_path)
+        tmp_path = None
 
-                        raise ValueError(
-                            "Verschlüsselte Datei ist unvollständig."
-                        )
-
-                    plaintext = decryptor.update(
-                        ct_chunk
-                    )
-
-                    if plaintext:
-
-                        if not metadata_done:
-
-                            metadata.extend(
-                                plaintext
-                            )
-
-                            if (
-                                name_len is None
-                                and len(metadata)
-                                >= NAME_LEN_SIZE
-                            ):
-
-                                name_len = struct.unpack(
-                                    ">I",
-                                    metadata[
-                                        :NAME_LEN_SIZE
-                                    ],
-                                )[0]
-
-                                if (
-                                    name_len == 0
-                                    or name_len > MAX_NAME_LEN
-                                ):
-
-                                    raise ValueError(
-                                        "Ungültiges Dateiformat: "
-                                        "ungültiger Dateiname."
-                                    )
-
-                            if (
-                                name_len is not None
-                                and len(metadata)
-                                >= (
-                                    NAME_LEN_SIZE
-                                    + name_len
-                                )
-                            ):
-
-                                name_bytes = bytes(
-                                    metadata[
-                                        NAME_LEN_SIZE:
-                                        NAME_LEN_SIZE
-                                        + name_len
-                                    ]
-                                )
-
-                                try:
-
-                                    name_bytes.decode(
-                                        "utf-8"
-                                    )
-
-                                except UnicodeDecodeError:
-
-                                    raise ValueError(
-                                        "Ungültiger Dateiname."
-                                    )
-
-                                metadata_done = True
-
-                                remaining = metadata[
-                                    NAME_LEN_SIZE
-                                    + name_len:
-                                ]
-
-                                if remaining:
-
-                                    fout.write(
-                                        remaining
-                                    )
-
-                                metadata.clear()
-
-                        else:
-
-                            fout.write(
-                                plaintext
-                            )
-
-                    bytes_read += len(
-                        ct_chunk
-                    )
-
-                    if progress_cb:
-
-                        data_done = max(
-                            0,
-                            bytes_read
-                            - NAME_LEN_SIZE
-                            - (
-                                name_len
-                                if name_len is not None
-                                else 0
-                            ),
-                        )
-
-                        data_total = max(
-                            1,
-                            ciphertext_size
-                            - NAME_LEN_SIZE
-                            - (
-                                name_len
-                                if name_len is not None
-                                else 0
-                            ),
-                        )
-
-                        progress_cb(
-                            min(
-                                data_done,
-                                data_total,
-                            ),
-                            data_total,
-                        )
-
-                # ------------------------------------------------
-                # Sicherheitskritisch:
-                #
-                # Erst finalize() bestätigt die GCM-Authentizität.
-                # ------------------------------------------------
-
-                final_plaintext = (
-                    decryptor.finalize()
-                )
-
-                if final_plaintext:
-
-                    if not metadata_done:
-
-                        metadata.extend(
-                            final_plaintext
-                        )
-
-                        if (
-                            name_len is None
-                            and len(metadata)
-                            >= NAME_LEN_SIZE
-                        ):
-
-                            name_len = struct.unpack(
-                                ">I",
-                                metadata[
-                                    :NAME_LEN_SIZE
-                                ],
-                            )[0]
-
-                            if (
-                                name_len == 0
-                                or name_len > MAX_NAME_LEN
-                            ):
-
-                                raise ValueError(
-                                    "Ungültiges Dateiformat: "
-                                    "ungültiger Dateiname."
-                                )
-
-                        if (
-                            name_len is not None
-                            and len(metadata)
-                            >= (
-                                NAME_LEN_SIZE
-                                + name_len
-                            )
-                        ):
-
-                            name_bytes = bytes(
-                                metadata[
-                                    NAME_LEN_SIZE:
-                                    NAME_LEN_SIZE
-                                    + name_len
-                                ]
-                            )
-
-                            try:
-
-                                name_bytes.decode(
-                                    "utf-8"
-                                )
-
-                            except UnicodeDecodeError:
-
-                                raise ValueError(
-                                    "Ungültiger Dateiname."
-                                )
-
-                            metadata_done = True
-
-                            remaining = metadata[
-                                NAME_LEN_SIZE
-                                + name_len:
-                            ]
-
-                            if remaining:
-
-                                fout.write(
-                                    remaining
-                                )
-
-                            metadata.clear()
-
-                    else:
-
-                        fout.write(
-                            final_plaintext
-                        )
-
-                if not metadata_done:
-
-                    raise ValueError(
-                        "Verschlüsselte Datei enthält "
-                        "keinen gültigen Dateinamen."
-                    )
-
-                fout.flush()
-
-                os.fsync(
-                    fout.fileno()
-                )
-
-            # Erst jetzt ist die Entschlüsselung authentifiziert.
-            install_temp_no_overwrite(
-                tmp_path,
-                output_path,
-            )
-
-            tmp_path = None
-
-            return output_path
-
-    except InvalidTag:
-
-        raise ValueError(
-            "Falsches Passwort oder beschädigte Datei."
-        )
-
-    finally:
-
+    except Exception:
         if tmp_path:
-
             try:
-
-                os.unlink(
-                    tmp_path
-                )
-
+                os.unlink(tmp_path)
             except OSError:
                 pass
+        raise
 
 
-def get_original_filename(
-    enc_path,
-    password,
-):
+def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
+    input_path = os.path.abspath(input_path)
+    output_path = os.path.abspath(output_path)
 
-    enc_path = os.path.abspath(
-        enc_path
-    )
+    if input_path == output_path:
+        raise ValueError("Quelle und Ziel dürfen nicht identisch sein.")
 
-    fsize = os.path.getsize(
-        enc_path
-    )
+    fsize = os.path.getsize(input_path)
+    tmp_path = None
 
-    header_size = (
-        len(MAGIC)
-        + 1
-        + SALT_SIZE
-        + NONCE_SIZE
-    )
+    with open(input_path, "rb") as fin:
+        salt, base_nonce, chunk_size, file_size, data_chunk_count, header = read_v3_header(fin)
 
-    if fsize < (
-        header_size
-        + NAME_LEN_SIZE
-        + 1
-        + TAG_SIZE
-    ):
+        if chunk_size != CHUNK_SIZE:
+            # Andere gültige AESCRYPT3-Chunkgrößen dürfen gelesen werden;
+            # sie müssen nur innerhalb der Formatgrenzen liegen.
+            if chunk_size <= 0 or chunk_size > MAX_V3_CHUNK_SIZE:
+                raise ValueError("Ungültige AESCRYPT3-Chunk-Größe.")
 
-        raise ValueError(
-            "Datei zu klein oder beschädigt."
-        )
+        # Ein Minimalcheck verhindert offensichtlich abgeschnittene Dateien.
+        minimum_size = len(header) + V3_RECORD_HEADER_SIZE + TAG_SIZE
+        if fsize < minimum_size:
+            raise ValueError("AESCRYPT3-Datei zu klein oder beschädigt.")
 
-    with open(
-        enc_path,
-        "rb",
-    ) as fin:
+        aes_key = derive_key(password, salt)
 
-        (
-            salt,
-            nonce,
-            header,
-        ) = read_header(fin)
-
-        fin.seek(
-            fsize - TAG_SIZE
-        )
-
-        tag = fin.read(
-            TAG_SIZE
-        )
-
-        ciphertext_size = (
-            fsize
-            - len(header)
-            - TAG_SIZE
-        )
-
-        if ciphertext_size < (
-            NAME_LEN_SIZE + 1
-        ):
-
-            raise ValueError(
-                "Ungültige Dateistruktur."
-            )
-
-        aes_key = derive_key(
-            password,
-            salt,
-        )
-
-        cipher = Cipher(
-            algorithms.AES(aes_key),
-            modes.GCM(
-                nonce,
-                tag,
-            ),
-        )
-
-        decryptor = cipher.decryptor()
-
-        decryptor.authenticate_additional_data(
-            header
-        )
-
-        fin.seek(
-            len(header)
-        )
-
-        metadata = bytearray()
-
-        while len(metadata) < NAME_LEN_SIZE:
-
-            remaining_ciphertext = (
-                ciphertext_size
-                - len(metadata)
-            )
-
-            if remaining_ciphertext <= 0:
-
-                raise ValueError(
-                    "Verschlüsselte Datei enthält "
-                    "keinen gültigen Dateinamen."
-                )
-
-            chunk = fin.read(
-                min(
-                    CHUNK_SIZE,
-                    remaining_ciphertext,
-                )
-            )
-
-            if not chunk:
-
-                raise ValueError(
-                    "Verschlüsselte Datei enthält "
-                    "keinen gültigen Dateinamen."
-                )
-
-            metadata.extend(
-                decryptor.update(
-                    chunk
-                )
-            )
-
-        name_len = struct.unpack(
-            ">I",
-            metadata[
-                :NAME_LEN_SIZE
-            ],
-        )[0]
-
-        if (
-            name_len == 0
-            or name_len > MAX_NAME_LEN
-        ):
-
-            raise ValueError(
-                "Ungültiges Dateiformat: "
-                "ungültiger Dateiname."
-            )
-
-        needed = (
-            NAME_LEN_SIZE
-            + name_len
-        )
-
-        while len(metadata) < needed:
-
-            consumed = len(metadata)
-
-            remaining_ciphertext = (
-                ciphertext_size
-                - consumed
-            )
-
-            if remaining_ciphertext <= 0:
-
-                raise ValueError(
-                    "Verschlüsselte Datei enthält "
-                    "keinen vollständigen Dateinamen."
-                )
-
-            chunk = fin.read(
-                min(
-                    CHUNK_SIZE,
-                    remaining_ciphertext,
-                )
-            )
-
-            if not chunk:
-
-                raise ValueError(
-                    "Verschlüsselte Datei enthält "
-                    "keinen vollständigen Dateinamen."
-                )
-
-            metadata.extend(
-                decryptor.update(
-                    chunk
-                )
-            )
-
-        # Die komplette Datei muss durch den Decryptor laufen,
-        # damit der GCM-Tag geprüft werden kann.
-        consumed = len(metadata)
-
-        while consumed < ciphertext_size:
-
-            remaining = (
-                ciphertext_size
-                - consumed
-            )
-
-            read_size = min(
-                CHUNK_SIZE,
-                remaining,
-            )
-
-            chunk = fin.read(
-                read_size
-            )
-
-            if len(chunk) != read_size:
-
-                raise ValueError(
-                    "Verschlüsselte Datei ist unvollständig."
-                )
-
-            decryptor.update(
-                chunk
-            )
-
-            consumed += len(
-                chunk
-            )
-
-        decryptor.finalize()
-
-        name_bytes = bytes(
-            metadata[
-                NAME_LEN_SIZE:
-                NAME_LEN_SIZE
-                + name_len
-            ]
+        out_dir = os.path.dirname(output_path) or "."
+        os.makedirs(out_dir, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=out_dir, prefix=".aescrypto-", suffix=".tmp"
         )
 
         try:
+            with os.fdopen(tmp_fd, "wb") as fout:
+                # Chunk 0: Dateiname/Metadaten. Er muss vor dem ersten Datenchunk
+                # vollständig und authentisch sein.
+                first = read_v3_chunk(fin)
+                if first is None:
+                    raise ValueError("AESCRYPT3-Datei enthält keine Metadaten.")
 
-            return name_bytes.decode(
-                "utf-8"
+                index, plain_size, ciphertext, tag = first
+                if index != 0:
+                    raise ValueError("AESCRYPT3-Datei beginnt nicht mit Metadaten.")
+
+                metadata = decrypt_v3_chunk(
+                    aes_key, base_nonce, header, index, plain_size, ciphertext, tag
+                )
+
+                if len(metadata) < NAME_LEN_SIZE:
+                    raise ValueError("AESCRYPT3-Dateiname fehlt.")
+
+                name_len = struct.unpack(">I", metadata[:NAME_LEN_SIZE])[0]
+                if name_len == 0 or name_len > MAX_NAME_LEN:
+                    raise ValueError("Ungültiges Dateiformat: ungültiger Dateiname.")
+                if len(metadata) != NAME_LEN_SIZE + name_len:
+                    raise ValueError("AESCRYPT3-Metadaten sind ungültig.")
+
+                try:
+                    name_bytes = metadata[NAME_LEN_SIZE:]
+                    name_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise ValueError("Ungültiger Dateiname.")
+
+                expected_total_data = file_size
+                bytes_written = 0
+
+                for expected_index in range(1, data_chunk_count + 1):
+                    record = read_v3_chunk(fin)
+                    if record is None:
+                        raise ValueError("AESCRYPT3-Datei ist unvollständig.")
+
+                    index, plain_size, ciphertext, tag = record
+                    if index != expected_index:
+                        raise ValueError("AESCRYPT3-Chunk-Reihenfolge oder Chunk-Anzahl ist ungültig.")
+
+                    expected_size = min(
+                        chunk_size,
+                        expected_total_data - bytes_written
+                    )
+                    if plain_size != expected_size:
+                        raise ValueError("AESCRYPT3-Chunk hat eine unerwartete Größe.")
+
+                    plaintext = decrypt_v3_chunk(
+                        aes_key, base_nonce, header, index, plain_size, ciphertext, tag
+                    )
+
+                    fout.write(plaintext)
+                    bytes_written += len(plaintext)
+
+                    if progress_cb:
+                        progress_cb(bytes_written, file_size)
+
+                if bytes_written != file_size:
+                    raise ValueError("AESCRYPT3-Dateigröße stimmt nicht mit dem Header überein.")
+
+                # Nach dem erwarteten letzten Chunk darf nichts mehr folgen.
+                trailing = fin.read(1)
+                if trailing:
+                    raise ValueError("AESCRYPT3-Datei enthält unerwartete zusätzliche Daten.")
+
+                fout.flush()
+                os.fsync(fout.fileno())
+
+            # Erst nach erfolgreicher Authentifizierung und vollständiger
+            # Strukturprüfung wird die temporäre Klartextdatei sichtbar installiert.
+            install_temp_no_overwrite(tmp_path, output_path)
+            tmp_path = None
+            return output_path
+
+        except Exception:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise
+
+
+def decrypt_file_v2(input_path, output_path, password, progress_cb=None):
+    """AESCRYPT2-Legacy-Entschlüsselung. Alte Dateien bleiben lesbar."""
+    input_path = os.path.abspath(input_path)
+    output_path = os.path.abspath(output_path)
+
+    if input_path == output_path:
+        raise ValueError("Quelle und Ziel dürfen nicht identisch sein.")
+
+    fsize = os.path.getsize(input_path)
+    header_size = len(MAGIC) + 1 + SALT_SIZE + NONCE_SIZE
+    minimum_size = header_size + NAME_LEN_SIZE + 1 + TAG_SIZE
+    if fsize < minimum_size:
+        raise ValueError("Datei zu klein oder beschädigt.")
+
+    tmp_path = None
+    try:
+        with open(input_path, "rb") as fin:
+            salt, nonce, header = read_header(fin)
+
+            fin.seek(fsize - TAG_SIZE)
+            tag = fin.read(TAG_SIZE)
+            if len(tag) != TAG_SIZE:
+                raise ValueError("Authentifizierungs-Tag fehlt.")
+
+            ciphertext_size = fsize - len(header) - TAG_SIZE
+            if ciphertext_size < NAME_LEN_SIZE + 1:
+                raise ValueError("Ungültige Dateistruktur.")
+
+            aes_key = derive_key(password, salt)
+            cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
+            decryptor = cipher.decryptor()
+            decryptor.authenticate_additional_data(header)
+
+            # Legacy-Dateien werden vollständig in RAM authentifiziert, bevor
+            # überhaupt eine Klartext-Ausgabedatei angelegt wird.
+            fin.seek(len(header))
+            plaintext = bytearray()
+            remaining = ciphertext_size
+            processed = 0
+
+            while remaining:
+                chunk = fin.read(min(CHUNK_SIZE, remaining))
+                if not chunk:
+                    raise ValueError("Verschlüsselte Datei ist unvollständig.")
+                plaintext.extend(decryptor.update(chunk))
+                processed += len(chunk)
+                remaining -= len(chunk)
+                if progress_cb:
+                    progress_cb(processed, ciphertext_size)
+
+            try:
+                plaintext.extend(decryptor.finalize())
+            except InvalidTag:
+                raise ValueError("Falsches Passwort oder beschädigte Datei.")
+
+            if len(plaintext) < NAME_LEN_SIZE + 1:
+                raise ValueError("Verschlüsselte Datei enthält keinen gültigen Dateinamen.")
+
+            name_len = struct.unpack(">I", plaintext[:NAME_LEN_SIZE])[0]
+            if name_len == 0 or name_len > MAX_NAME_LEN:
+                raise ValueError("Ungültiges Dateiformat: ungültiger Dateiname.")
+
+            name_end = NAME_LEN_SIZE + name_len
+            if len(plaintext) < name_end:
+                raise ValueError("Verschlüsselte Datei enthält keinen vollständigen Dateinamen.")
+
+            try:
+                bytes(plaintext[NAME_LEN_SIZE:name_end]).decode("utf-8")
+            except UnicodeDecodeError:
+                raise ValueError("Ungültiger Dateiname.")
+
+            out_dir = os.path.dirname(output_path) or "."
+            os.makedirs(out_dir, exist_ok=True)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=out_dir, prefix=".aescrypto-", suffix=".tmp"
             )
 
-        except UnicodeDecodeError:
+            with os.fdopen(tmp_fd, "wb") as fout:
+                fout.write(plaintext[name_end:])
+                fout.flush()
+                os.fsync(fout.fileno())
 
-            raise ValueError(
-                "Ungültiger Dateiname."
+        install_temp_no_overwrite(tmp_path, output_path)
+        tmp_path = None
+        return output_path
+
+    except Exception:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
+def decrypt_file(input_path, output_path, password, progress_cb=None):
+    """Automatische Format-Erkennung; AESCRYPT2 bleibt abwärtskompatibel."""
+    input_path = os.path.abspath(input_path)
+    with open(input_path, "rb") as fin:
+        magic = fin.read(len(MAGIC_V3))
+
+    if magic == MAGIC_V3:
+        return decrypt_file_v3(input_path, output_path, password, progress_cb)
+
+    if magic == MAGIC:
+        return decrypt_file_v2(input_path, output_path, password, progress_cb)
+
+    raise ValueError("Ungültiges oder nicht unterstütztes Dateiformat.")
+
+
+def get_original_filename(enc_path, password):
+    enc_path = os.path.abspath(enc_path)
+    with open(enc_path, "rb") as fin:
+        magic = fin.read(len(MAGIC_V3))
+
+    if magic == MAGIC_V3:
+        with open(enc_path, "rb") as fin:
+            salt, base_nonce, chunk_size, file_size, data_chunk_count, header = read_v3_header(fin)
+            aes_key = derive_key(password, salt)
+            record = read_v3_chunk(fin)
+            if record is None:
+                raise ValueError("AESCRYPT3-Datei enthält keine Metadaten.")
+            index, plain_size, ciphertext, tag = record
+            if index != 0:
+                raise ValueError("AESCRYPT3-Metadaten fehlen.")
+            metadata = decrypt_v3_chunk(
+                aes_key, base_nonce, header, index, plain_size, ciphertext, tag
             )
+            if len(metadata) < NAME_LEN_SIZE:
+                raise ValueError("Verschlüsselte Datei enthält keinen gültigen Dateinamen.")
+            name_len = struct.unpack(">I", metadata[:NAME_LEN_SIZE])[0]
+            if name_len == 0 or name_len > MAX_NAME_LEN or len(metadata) != NAME_LEN_SIZE + name_len:
+                raise ValueError("Ungültiges Dateiformat: ungültiger Dateiname.")
+            try:
+                return metadata[NAME_LEN_SIZE:].decode("utf-8")
+            except UnicodeDecodeError:
+                raise ValueError("Ungültiger Dateiname.")
 
+    if magic == MAGIC:
+        # Für AESCRYPT2 wird die vollständige Datei authentifiziert, bevor
+        # der Dateiname zurückgegeben wird. Das entspricht dem Legacy-Format.
+        fsize = os.path.getsize(enc_path)
+        header_size = len(MAGIC) + 1 + SALT_SIZE + NONCE_SIZE
+        if fsize < header_size + NAME_LEN_SIZE + 1 + TAG_SIZE:
+            raise ValueError("Datei zu klein oder beschädigt.")
 
-# ============================================================
-# Originaldatei löschen
-# ============================================================
+        with open(enc_path, "rb") as fin:
+            salt, nonce, header = read_header(fin)
+            fin.seek(fsize - TAG_SIZE)
+            tag = fin.read(TAG_SIZE)
+            ciphertext_size = fsize - len(header) - TAG_SIZE
+            aes_key = derive_key(password, salt)
+            cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
+            decryptor = cipher.decryptor()
+            decryptor.authenticate_additional_data(header)
+            fin.seek(len(header))
+            plaintext = bytearray()
+            remaining = ciphertext_size
+            while remaining:
+                chunk = fin.read(min(CHUNK_SIZE, remaining))
+                if not chunk:
+                    raise ValueError("Verschlüsselte Datei ist unvollständig.")
+                plaintext.extend(decryptor.update(chunk))
+                remaining -= len(chunk)
+            try:
+                plaintext.extend(decryptor.finalize())
+            except InvalidTag:
+                raise ValueError("Falsches Passwort oder beschädigte Datei.")
+
+            if len(plaintext) < NAME_LEN_SIZE + 1:
+                raise ValueError("Verschlüsselte Datei enthält keinen gültigen Dateinamen.")
+            name_len = struct.unpack(">I", plaintext[:NAME_LEN_SIZE])[0]
+            if name_len == 0 or name_len > MAX_NAME_LEN or len(plaintext) < NAME_LEN_SIZE + name_len:
+                raise ValueError("Ungültiges Dateiformat: ungültiger Dateiname.")
+            try:
+                return bytes(plaintext[NAME_LEN_SIZE:NAME_LEN_SIZE + name_len]).decode("utf-8")
+            except UnicodeDecodeError:
+                raise ValueError("Ungültiger Dateiname.")
+
+    raise ValueError("Ungültiges oder nicht unterstütztes Dateiformat.")
+
 
 def delete_original_file(filepath):
-
     if not os.path.lexists(filepath):
         return
-
     try:
-
-        os.remove(
-            filepath
-        )
-
+        os.remove(filepath)
     except OSError as e:
+        raise RuntimeError(f"Datei konnte nicht entfernt werden: {e}")
 
-        raise RuntimeError(
-            f"Datei konnte nicht entfernt werden: {e}"
-        )
-
-
-# ============================================================
-# Dateien sammeln
-# ============================================================
 
 def collect_files(paths):
-
     files = []
-
     for p in paths:
-
         if not p:
             continue
-
-        p = os.path.abspath(
-            p
-        )
-
+        p = os.path.abspath(p)
         if os.path.islink(p):
             continue
-
         if os.path.isfile(p):
-
-            files.append(
-                p
-            )
-
+            files.append(p)
         elif os.path.isdir(p):
-
-            for root, dirs, fnames in os.walk(
-                p,
-                followlinks=False,
-            ):
-
-                dirs[:] = [
-                    d
-                    for d in dirs
-                    if not os.path.islink(
-                        os.path.join(
-                            root,
-                            d,
-                        )
-                    )
-                ]
-
+            for root, dirs, fnames in os.walk(p, followlinks=False):
+                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
                 for fn in fnames:
-
-                    fp = os.path.join(
-                        root,
-                        fn,
-                    )
-
-                    if not os.path.islink(
-                        fp
-                    ):
-
-                        files.append(
-                            os.path.abspath(
-                                fp
-                            )
-                        )
-
+                    fp = os.path.join(root, fn)
+                    if not os.path.islink(fp):
+                        files.append(os.path.abspath(fp))
     seen = set()
     result = []
-
     for f in files:
-
         if f not in seen:
-
-            seen.add(
-                f
-            )
-
-            result.append(
-                f
-            )
-
+            seen.add(f)
+            result.append(f)
     return result
 
 
-# ============================================================
-# Ausgabe-Pfade
-# ============================================================
-
-def make_encrypt_output_path(
-    fpath,
-    encrypt_filename=False,
-):
-
-    fpath = os.path.abspath(
-        fpath
-    )
-
+def make_encrypt_output_path(fpath, encrypt_filename=False):
+    fpath = os.path.abspath(fpath)
     if encrypt_filename:
-
-        directory = os.path.dirname(
-            fpath
-        ) or "."
-
+        directory = os.path.dirname(fpath) or "."
         while True:
-
-            random_name = (
-                secrets.token_hex(
-                    32
-                )
-                + ".enc"
-            )
-
-            candidate = os.path.join(
-                directory,
-                random_name,
-            )
-
-            if not os.path.lexists(
-                candidate
-            ):
-
+            random_name = secrets.token_hex(32) + ".enc"
+            candidate = os.path.join(directory, random_name)
+            if not os.path.lexists(candidate):
                 return candidate
 
-    out_path = (
-        fpath
-        + ".enc"
-    )
-
-    if not os.path.exists(
-        out_path
-    ):
-
+    out_path = fpath + ".enc"
+    if not os.path.exists(out_path):
         return out_path
 
-    base, ext = os.path.splitext(
-        fpath
-    )
-
+    base, ext = os.path.splitext(fpath)
     counter = 1
-
     while True:
-
-        candidate = (
-            f"{base}_conflict"
-            f"{counter}"
-            f"{ext}.enc"
-        )
-
-        if not os.path.exists(
-            candidate
-        ):
-
+        candidate = f"{base}_conflict{counter}{ext}.enc"
+        if not os.path.exists(candidate):
             return candidate
-
         counter += 1
 
 
-def make_decrypt_output_path(
-    fpath,
-    password,
-):
-
-    fpath = os.path.abspath(
-        fpath
-    )
-
-    orig_name = get_original_filename(
-        fpath,
-        password,
-    )
-
-    orig_name = os.path.basename(
-        orig_name
-    )
-
+def make_decrypt_output_path(fpath, password):
+    fpath = os.path.abspath(fpath)
+    orig_name = get_original_filename(fpath, password)
+    orig_name = os.path.basename(orig_name)
     if not orig_name:
+        raise ValueError("Ungültiger Original-Dateiname.")
 
-        raise ValueError(
-            "Ungültiger Original-Dateiname."
-        )
-
-    directory = os.path.dirname(
-        fpath
-    )
-
-    out_path = os.path.join(
-        directory,
-        orig_name
-    )
-
-    if not os.path.exists(
-        out_path
-    ):
-
+    directory = os.path.dirname(fpath)
+    out_path = os.path.join(directory, orig_name)
+    if not os.path.exists(out_path):
         return out_path
 
-    name, ext = os.path.splitext(
-        orig_name
-    )
-
+    name, ext = os.path.splitext(orig_name)
     counter = 1
-
     while True:
-
-        candidate = os.path.join(
-            directory,
-            f"{name}_restored"
-            f"{counter}"
-            f"{ext}",
-        )
-
-        if not os.path.exists(
-            candidate
-        ):
-
+        candidate = os.path.join(directory, f"{name}_restored{counter}{ext}")
+        if not os.path.exists(candidate):
             return candidate
-
         counter += 1
 
 
-# ============================================================
-# Einzelverarbeitung
-# ============================================================
-
-def process_single(
-    fpath,
-    password,
-    delete_original,
-    encrypt_filename=False,
-):
-
-    mode = (
-        "decrypt"
-        if fpath.lower().endswith(
-            ".enc"
-        )
-        else "encrypt"
-    )
-
+def process_single(fpath, password, delete_original, encrypt_filename=False):
+    mode = "decrypt" if fpath.lower().endswith(".enc") else "encrypt"
     try:
-
         if mode == "encrypt":
-
-            out_path = (
-                make_encrypt_output_path(
-                    fpath,
-                    encrypt_filename,
-                )
-            )
-
-            encrypt_file(
-                fpath,
-                out_path,
-                password,
-            )
-
+            out_path = make_encrypt_output_path(fpath, encrypt_filename)
+            encrypt_file(fpath, out_path, password)
         else:
-
-            out_path = (
-                make_decrypt_output_path(
-                    fpath,
-                    password,
-                )
-            )
-
-            decrypt_file(
-                fpath,
-                out_path,
-                password,
-            )
+            out_path = make_decrypt_output_path(fpath, password)
+            decrypt_file(fpath, out_path, password)
 
         if delete_original:
-
             try:
-
-                delete_original_file(
-                    fpath
-                )
-
+                delete_original_file(fpath)
             except Exception:
+                return False, f"{os.path.basename(fpath)}: {mode} erfolgreich, Original konnte nicht entfernt werden."
 
-                return (
-                    False,
-                    f"{os.path.basename(fpath)}: "
-                    f"{mode} erfolgreich, "
-                    f"Original konnte nicht entfernt werden.",
-                )
-
-        return (
-            True,
-            f"{os.path.basename(fpath)} "
-            f"({mode})",
-        )
-
+        return True, f"{os.path.basename(fpath)} ({mode})"
     except Exception as e:
-
-        return (
-            False,
-            f"{os.path.basename(fpath)}: {e}",
-        )
-
-
-def _cli_process_single(
-    fpath,
-    password,
-    delete_original,
-    encrypt_filename,
-):
-
-    ok, msg = process_single(
-        fpath,
-        password,
-        delete_original,
-        encrypt_filename,
-    )
-
-    return (
-        f"OK: {msg}"
-        if ok
-        else f"FEHLER: {msg}"
-    )
+        return False, f"{os.path.basename(fpath)}: {str(e)}"
 
 
 # ============================================================
-# CLI
+# Grafische Benutzeroberfläche (GUI)
 # ============================================================
 
-def run_cli():
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "AES Crypto CLI - "
-            "Ver-/Entschlüsselung"
-        )
-    )
-
-    parser.add_argument(
-        "-f",
-        "--files",
-        nargs="+",
-        default=[],
-        help="Dateien",
-    )
-
-    parser.add_argument(
-        "-d",
-        "--dirs",
-        nargs="+",
-        default=[],
-        help="Ordner",
-    )
-
-    parser.add_argument(
-        "-w",
-        "--workers",
-        type=int,
-        default=min(
-            4,
-            multiprocessing.cpu_count() or 1,
-        ),
-        help="Parallele Worker",
-    )
-
-    parser.add_argument(
-        "--keep-original",
-        action="store_true",
-        help="Original nicht löschen",
-    )
-
-    parser.add_argument(
-        "--encrypt-filename",
-        action="store_true",
-        help=(
-            "Beim Verschlüsseln einen zufälligen "
-            "Dateinamen für die .enc-Datei verwenden"
-        ),
-    )
-
-    args = parser.parse_args()
-
-    if not args.files and not args.dirs:
-
-        parser.error(
-            "Mindestens --files oder --dirs angeben."
-        )
-
-    if args.workers < 1:
-
-        parser.error(
-            "--workers muss mindestens 1 sein."
-        )
-
-    try:
-
-        password = getpass.getpass(
-            "Passwort eingeben: "
-        )
-
-    except KeyboardInterrupt:
-
-        print(
-            "\nAbbruch durch Benutzer."
-        )
-
-        sys.exit(1)
-
-    if not password:
-
-        print(
-            "Leeres Passwort nicht erlaubt."
-        )
-
-        sys.exit(1)
-
-    all_files = collect_files(
-        args.files
-        + args.dirs
-    )
-
-    if not all_files:
-
-        print(
-            "Keine verarbeitbaren Dateien gefunden."
-        )
-
-        sys.exit(1)
-
-    print(
-        f"{len(all_files)} Datei(en) gefunden."
-    )
-
-    successful = 0
-    failed = 0
-
-    with ThreadPoolExecutor(
-        max_workers=args.workers
-    ) as executor:
-
-        futures = {
-            executor.submit(
-                _cli_process_single,
-                f,
-                password,
-                not args.keep_original,
-                args.encrypt_filename,
-            ): f
-            for f in all_files
-        }
-
-        for future in as_completed(
-            futures
-        ):
-
-            result = future.result()
-
-            print(
-                result
-            )
-
-            if result.startswith(
-                "OK:"
-            ):
-
-                successful += 1
-
-            else:
-
-                failed += 1
-
-    print()
-
-    print(
-        f"Fertig: {successful} erfolgreich, "
-        f"{failed} Fehler."
-    )
-
-    sys.exit(
-        1
-        if failed
-        else 0
-    )
-
-
-# ============================================================
-# Tray Icon
-# ============================================================
-
-def create_shield_icon(
-    size=32,
-):
-
-    img = Image.new(
-        "RGBA",
-        (
-            size,
-            size,
-        ),
-        (
-            0,
-            0,
-            0,
-            0,
-        ),
-    )
-
-    d = ImageDraw.Draw(
-        img
-    )
-
-    def i(v):
-
-        return int(
-            round(v)
-        )
-
-    m = size * 0.1
-
-    shield = [
-        (
-            m,
-            m * 1.2,
-        ),
-        (
-            size - m,
-            m * 1.2,
-        ),
-        (
-            size - m * 0.7,
-            size * 0.38,
-        ),
-        (
-            size / 2,
-            size - m * 1.4,
-        ),
-        (
-            m * 0.7,
-            size * 0.38,
-        ),
-    ]
-
-    d.polygon(
-        [
-            (
-                i(x),
-                i(y),
-            )
-            for x, y in shield
-        ],
-        fill="#0B132B",
-        outline="#1C2541",
-        width=1,
-    )
-
-    im = m * 1.5
-
-    inner = [
-        (
-            m + im * 0.8,
-            m * 1.2 + im * 0.8,
-        ),
-        (
-            size - m - im * 0.8,
-            m * 1.2 + im * 0.8,
-        ),
-        (
-            size - m * 0.7 - im * 0.5,
-            size * 0.38 + im * 0.4,
-        ),
-        (
-            size / 2,
-            size - m * 1.4 - im * 1.1,
-        ),
-        (
-            m * 0.7 + im * 0.5,
-            size * 0.38 + im * 0.4,
-        ),
-    ]
-
-    d.polygon(
-        [
-            (
-                i(x),
-                i(y),
-            )
-            for x, y in inner
-        ],
-        fill="#3A506B",
-    )
-
-    lw = size * 0.26
-    lh = size * 0.20
-
-    lx = size / 2 - lw / 2
-    ly = size * 0.44
-
-    d.rectangle(
-        [
-            i(lx),
-            i(ly),
-            i(lx + lw),
-            i(ly + lh),
-        ],
-        fill="#E0E0E0",
-    )
-
-    sr = size * 0.07
-
-    d.arc(
-        [
-            i(lx + lw * 0.25),
-            i(ly - sr * 1.8),
-            i(lx + lw * 0.75),
-            i(ly),
-        ],
-        start=180,
-        end=0,
-        fill="#E0E0E0",
-        width=max(
-            1,
-            i(size * 0.06),
-        ),
-    )
-
-    kh = size * 0.02
-
-    d.ellipse(
-        [
-            i(size / 2 - kh),
-            i(ly + lh * 0.3),
-            i(size / 2 + kh),
-            i(ly + lh * 0.3 + kh * 2),
-        ],
-        fill="#0B132B",
-    )
-
-    keyhole = [
-        (
-            size / 2 - kh * 0.9,
-            ly + lh * 0.5,
-        ),
-        (
-            size / 2 + kh * 0.9,
-            ly + lh * 0.5,
-        ),
-        (
-            size / 2,
-            ly + lh * 0.8,
-        ),
-    ]
-
-    d.polygon(
-        [
-            (
-                i(x),
-                i(y),
-            )
-            for x, y in keyhole
-        ],
-        fill="#0B132B",
-    )
-
-    return img
-
-
-# ============================================================
-# GUI
-# ============================================================
-
-class CryptoGUI:
-
-    DROP_IDLE_BG = None
-    DROP_HOVER_BG = "#D6F5D6"
-
-    def __init__(
-        self,
-        root,
-        initial_paths=None,
-    ):
-
-        self.root = root
-
-        self.root.title(
-            "AES Crypto"
-        )
-
-        self.root.geometry(
-            "560x510"
-        )
-
-        self.root.minsize(
-            520,
-            470,
-        )
-
-        self.queue = queue.Queue()
-
-        self.worker_running = False
-
-        self._session_password = None
-
-        self.selected_paths = []
-
-        self.tray = None
-
-        self.closing = False
-
-        self.dnd_active = False
-
-        # ----------------------------------------------------
-        # Tray-/Fenster-Icon intern erzeugen
-        # ----------------------------------------------------
-
-        self.app_icon = create_shield_icon(
-            32
-        )
-
-        buf = io.BytesIO()
-
-        self.app_icon.save(
-            buf,
-            format="PNG",
-        )
-
-        self.tk_icon = tk.PhotoImage(
-            data=buf.getvalue()
-        )
-
-        self.root.iconphoto(
-            True,
-            self.tk_icon,
-        )
-
-        self._build_ui()
-
-        self._setup_dnd()
-
-        self._setup_tray()
-
-        self._center_window()
-
-        self.root.after(
-            100,
-            self._process_queue,
-        )
-
-        self.root.bind_all(
-            "<Control-q>",
-            lambda e: self._request_exit(),
-        )
-
-        self.root.bind_all(
-            "<Control-Q>",
-            lambda e: self._request_exit(),
-        )
-
-        self._update_listbox()
-
-        if initial_paths:
-
-            self._add_paths(
-                initial_paths
-            )
-
-    # --------------------------------------------------------
-    # UI
-    # --------------------------------------------------------
-
-    def _build_ui(self):
-
-        main = ttk.Frame(
-            self.root,
-            padding="10",
-        )
-
-        main.pack(
-            fill=tk.BOTH,
-            expand=True,
-        )
-
-        sel_frame = ttk.Frame(
-            main
-        )
-
-        sel_frame.pack(
-            fill=tk.X,
-            pady=(0, 4),
-        )
-
-        ttk.Button(
-            sel_frame,
-            text="Datei(en)",
-            command=self._add_files,
-        ).pack(
-            side=tk.LEFT,
-            padx=2,
-        )
-
-        ttk.Button(
-            sel_frame,
-            text="Ordner",
-            command=self._add_folder,
-        ).pack(
-            side=tk.LEFT,
-            padx=2,
-        )
-
-        ttk.Button(
-            sel_frame,
-            text="Leeren",
-            command=self._clear_selection,
-        ).pack(
-            side=tk.LEFT,
-            padx=2,
-        )
-
-        self.info_var = tk.StringVar(
-            value="Keine Auswahl"
-        )
-
-        ttk.Label(
-            main,
-            textvariable=self.info_var,
-            font=(
-                "TkDefaultFont",
-                8,
-                "bold",
-            ),
-        ).pack(
-            anchor=tk.W,
-            pady=(0, 2),
-        )
-
-        self.drop_hint_var = tk.StringVar(
-            value=(
-                "Dateien & Ordner hierher ziehen "
-                "(Drag & Drop)"
-            )
-        )
-
-        self.drop_frame = ttk.LabelFrame(
-            main,
-            padding=4,
-            text="Auswahl",
-        )
-
-        self.drop_frame.pack(
-            fill=tk.BOTH,
-            expand=True,
-            pady=(0, 6),
-        )
-
-        ttk.Label(
-            self.drop_frame,
-            textvariable=self.drop_hint_var,
-            font=(
-                "TkDefaultFont",
-                8,
-            ),
-        ).pack(
-            anchor=tk.W,
-            padx=2,
-            pady=(0, 2),
-        )
-
-        self.listbox = scrolledtext.ScrolledText(
-            self.drop_frame,
-            height=7,
-            state=tk.DISABLED,
-            font=(
-                "TkFixedFont",
-                8,
-            ),
-            relief=tk.FLAT,
-            borderwidth=0,
-        )
-
-        self.listbox.pack(
-            fill=tk.BOTH,
-            expand=True,
-        )
-
-        self.DROP_IDLE_BG = (
-            self.listbox.cget(
-                "background"
-            )
-        )
-
-        pw_frame = ttk.Frame(
-            main
-        )
-
-        pw_frame.pack(
-            fill=tk.X,
-            pady=(0, 4),
-        )
-
-        ttk.Label(
-            pw_frame,
-            text="Passwort:",
-        ).pack(
-            side=tk.LEFT
-        )
-
-        self.pass_var = tk.StringVar()
-
-        self.pass_entry = ttk.Entry(
-            pw_frame,
-            textvariable=self.pass_var,
-            show="*",
-            width=36,
-        )
-
-        self.pass_entry.pack(
-            side=tk.LEFT,
-            padx=4,
-        )
-
-        self.show_pw = tk.BooleanVar()
-
-        ttk.Checkbutton(
-            pw_frame,
-            text="Zeigen",
-            variable=self.show_pw,
-            command=self._toggle_pw,
-        ).pack(
-            side=tk.LEFT
-        )
-
-        self.delete_original = tk.BooleanVar(
-            value=True
-        )
-
-        ttk.Checkbutton(
-            main,
-            text=(
-                "Original nach erfolgreicher Verarbeitung löschen"
-            ),
-            variable=self.delete_original,
-        ).pack(
-            anchor=tk.W,
-            pady=(0, 3),
-        )
-
-        self.encrypt_filename = tk.BooleanVar(
-            value=False
-        )
-
-        ttk.Checkbutton(
-            main,
-            text=(
-                "Dateiname verschlüsseln "
-                "(zufälligen Dateinamen für .enc verwenden)"
-            ),
-            variable=self.encrypt_filename,
-        ).pack(
-            anchor=tk.W,
-            pady=(0, 6),
-        )
-
-        self.action_btn = ttk.Button(
-            main,
-            text="Ver-/Entschlüsseln",
-            command=self._run_batch,
-        )
-
-        self.action_btn.pack(
-            pady=(0, 4),
-        )
-
-        self.progress = ttk.Progressbar(
-            main,
-            orient=tk.HORIZONTAL,
-            mode="determinate",
-        )
-
-        self.progress.pack(
-            fill=tk.X,
-            pady=(0, 3),
-        )
-
-        self.status_var = tk.StringVar(
-            value="Bereit"
-        )
-
-        ttk.Label(
-            main,
-            textvariable=self.status_var,
-            foreground="gray",
-            font=(
-                "TkDefaultFont",
-                8,
-            ),
-        ).pack(
-            anchor=tk.W
-        )
-
-        self.root.protocol(
-            "WM_DELETE_WINDOW",
-            self._on_close,
-        )
-
-    # --------------------------------------------------------
-    # Drag & Drop
-    # --------------------------------------------------------
-
-    def _setup_dnd(self):
-
-        if (
-            not DND_AVAILABLE
-            or not hasattr(
-                self.root,
-                "drop_target_register",
-            )
-        ):
-
-            self.drop_hint_var.set(
-                "Drag & Drop inaktiv"
-            )
-
-            return
-
-        targets = (
-            self.listbox,
-            self.drop_frame,
-            self.root,
-        )
-
-        registered = False
-
-        for w in targets:
-
-            try:
-
-                w.drop_target_register(
-                    DND_FILES
-                )
-
-                w.dnd_bind(
-                    "<<DropEnter>>",
-                    self._on_drag_enter,
-                )
-
-                w.dnd_bind(
-                    "<<DropLeave>>",
-                    self._on_drag_leave,
-                )
-
-                w.dnd_bind(
-                    "<<Drop>>",
-                    self._on_drop,
-                )
-
-                registered = True
-
-            except Exception:
-                continue
-
-        self.dnd_active = registered
-
-        if not registered:
-
-            self.drop_hint_var.set(
-                "Drag & Drop konnte nicht initialisiert werden"
-            )
-
-    def _on_drag_enter(
-        self,
-        event,
-    ):
-
-        if self.worker_running:
-
-            self.drop_hint_var.set(
-                "Verarbeitung läuft"
-            )
-
-        else:
-
-            self.drop_hint_var.set(
-                "Loslassen zum Hinzufügen ..."
-            )
-
-            try:
-
-                self.listbox.config(
-                    background=self.DROP_HOVER_BG
-                )
-
-            except Exception:
-                pass
-
-        return getattr(
-            event,
-            "action",
-            None,
-        )
-
-    def _on_drag_leave(
-        self,
-        event=None,
-    ):
-
-        self.drop_hint_var.set(
-            "Dateien & Ordner hierher ziehen "
-            "(Drag & Drop)"
-        )
-
-        try:
-
-            self.listbox.config(
-                background=self.DROP_IDLE_BG
-            )
-
-        except Exception:
-            pass
-
-        return getattr(
-            event,
-            "action",
-            None,
-        )
-
-    def _on_drop(
-        self,
-        event,
-    ):
-
-        self._on_drag_leave()
-
-        if self.worker_running:
-
-            self.status_var.set(
-                "Verarbeitung läuft."
-            )
-
-            return getattr(
-                event,
-                "action",
-                None,
-            )
-
-        paths = self._parse_drop_data(
-            getattr(
-                event,
-                "data",
-                "",
-            )
-        )
-
-        if not paths:
-
-            self.status_var.set(
-                "Keine gültigen Pfade."
-            )
-
-            return getattr(
-                event,
-                "action",
-                None,
-            )
-
-        added, skipped = self._add_paths(
-            paths
-        )
-
-        if added and skipped:
-
-            self.status_var.set(
-                f"{added} hinzugefügt, "
-                f"{skipped} übersprungen"
-            )
-
-        elif added:
-
-            self.status_var.set(
-                f"{added} Pfad(e) hinzugefügt"
-            )
-
-        else:
-
-            self.status_var.set(
-                "Nichts hinzugefügt"
-            )
-
-        return getattr(
-            event,
-            "action",
-            None,
-        )
-
-    # --------------------------------------------------------
-    # Pfade
-    # --------------------------------------------------------
-
-    def _parse_drop_data(
-        self,
-        data,
-    ):
-
-        if isinstance(
-            data,
-            (list, tuple),
-        ):
-
-            candidates = [
-                [
-                    str(p)
-                    for p in data
-                ]
-            ]
-
-        else:
-
-            raw = str(
-                data or ""
-            ).strip()
-
-            if not raw:
-
-                return []
-
-            candidates = [
-                split_tcl_droplist(
-                    raw
-                )
-            ]
-
-            try:
-
-                candidates.append(
-                    list(
-                        self.root.tk.splitlist(
-                            raw
-                        )
-                    )
-                )
-
-            except Exception:
-                pass
-
-            candidates.append(
-                [
-                    raw
-                ]
-            )
-
-        best = []
-        best_hits = -1
-
-        for cand in candidates:
-
-            norm = [
-                normalize_dropped_path(
-                    c
-                )
-                for c in cand
-            ]
-
-            norm = [
-                n
-                for n in norm
-                if n
-            ]
-
-            hits = sum(
-                1
-                for n in norm
-                if os.path.exists(
-                    n
-                )
-            )
-
-            if norm and hits == len(norm):
-
-                return norm
-
-            if hits > best_hits:
-
-                best = norm
-                best_hits = hits
-
-        return best
-
-    def _add_paths(
-        self,
-        paths,
-    ):
-
-        added = 0
-        skipped = 0
-
-        for raw in paths:
-
-            p = normalize_dropped_path(
-                raw
-            )
-
-            if not p:
-
-                skipped += 1
-                continue
-
-            p = os.path.abspath(
-                p
-            )
-
-            if (
-                not os.path.exists(p)
-                or p in self.selected_paths
-            ):
-
-                skipped += 1
-                continue
-
-            self.selected_paths.append(
-                p
-            )
-
-            added += 1
-
-        if added:
-
-            self._update_listbox()
-
-        return (
-            added,
-            skipped,
-        )
-
-    # --------------------------------------------------------
-    # Tray
-    # --------------------------------------------------------
-
-    def _setup_tray(
-        self,
-    ):
-
-        if not GUI_AVAILABLE:
-            return
-
-        if sys.platform.startswith(
-            "linux"
-        ):
-            return
-
-        try:
-
-            menu = pystray.Menu(
-                item(
-                    "Zeigen",
-                    self._show_from_tray,
-                    default=True,
-                ),
-                item(
-                    "Beenden",
-                    self._request_exit,
-                ),
-            )
-
-            # Das intern mit PIL erzeugte Shield-Icon
-            # wird direkt für das Tray verwendet.
-            self.tray = pystray.Icon(
-                "AES Crypto",
-                self.app_icon,
-                "AES Crypto",
-                menu=menu,
-            )
-
-            self.tray.run_detached()
-
-        except Exception as e:
-
-            self.tray = None
-
-            try:
-
-                self.status_var.set(
-                    f"Tray nicht verfügbar: {e}"
-                )
-
-            except Exception:
-                pass
-
-    def _on_close(
-        self,
-    ):
-
-        if self.closing:
-            return
-
-        if self.tray is not None:
-
-            try:
-
-                self.root.withdraw()
-
-                return
-
-            except tk.TclError:
-                pass
-
-        self._request_exit()
-
-    def _request_exit(
-        self,
-        icon=None,
-        menu_item=None,
-    ):
-
-        if self.closing:
-            return
-
-        self.closing = True
-
-        try:
-
-            self.root.after(
-                0,
-                self._shutdown,
-            )
-
-        except (
-            tk.TclError,
-            RuntimeError,
-        ):
-
-            self._stop_tray()
-
-    def _shutdown(
-        self,
-    ):
-
-        self.closing = True
-
-        self._session_password = None
-
-        self.pass_var.set(
-            ""
-        )
-
-        self._stop_tray()
-
-        try:
-
-            self.root.quit()
-
-        except tk.TclError:
-            pass
-
-        try:
-
-            self.root.destroy()
-
-        except tk.TclError:
-            pass
-
-    def _stop_tray(
-        self,
-    ):
-
-        tray = self.tray
-
-        if tray is None:
-            return
-
-        self.tray = None
-
-        try:
-
-            tray.stop()
-
-        except Exception:
-            pass
-
-    def _show_from_tray(
-        self,
-        icon=None,
-        menu_item=None,
-    ):
-
-        if self.closing:
-            return
-
-        def show_window():
-
-            if self.closing:
-                return
-
-            try:
-
-                self.root.deiconify()
-                self.root.lift()
-                self.root.focus_force()
-
-                if sys.platform == "win32":
-
-                    try:
-
-                        self.root.attributes(
-                            "-topmost",
-                            True,
-                        )
-
-                        self.root.after(
-                            150,
-                            lambda: (
-                                self.root.attributes(
-                                    "-topmost",
-                                    False,
-                                )
-                                if not self.closing
-                                else None
-                            ),
-                        )
-
-                    except tk.TclError:
-                        pass
-
-            except tk.TclError:
-                pass
-
-        try:
-
-            self.root.after(
-                0,
-                show_window,
-            )
-
-        except (
-            tk.TclError,
-            RuntimeError,
-        ):
-
-            pass
-
-    # --------------------------------------------------------
-    # UI Hilfsfunktionen
-    # --------------------------------------------------------
-
-    def _center_window(
-        self,
-    ):
-
-        self.root.update_idletasks()
-
-        w = self.root.winfo_width()
-        h = self.root.winfo_height()
-
-        x = (
-            self.root.winfo_screenwidth()
-            // 2
-            - w // 2
-        )
-
-        y = (
-            self.root.winfo_screenheight()
-            // 2
-            - h // 2
-        )
-
-        self.root.geometry(
-            f"+{x}+{y}"
-        )
-
-    def _toggle_pw(
-        self,
-    ):
-
-        self.pass_entry.config(
-            show=(
-                ""
-                if self.show_pw.get()
-                else "*"
-            )
-        )
-
-    def _update_listbox(
-        self,
-    ):
-
-        self.listbox.config(
-            state=tk.NORMAL
-        )
-
-        self.listbox.delete(
-            "1.0",
-            tk.END,
-        )
-
-        if not self.selected_paths:
-
-            hint = (
-                "(leer)"
-                if not self.dnd_active
-                else "(leer) – Dateien/Ordner hierher ziehen"
-            )
-
-            self.listbox.insert(
-                tk.END,
-                hint,
-            )
-
-        else:
-
-            for p in self.selected_paths:
-
-                prefix = (
-                    "Ordner "
-                    if os.path.isdir(p)
-                    else "Datei "
-                )
-
-                self.listbox.insert(
-                    tk.END,
-                    prefix
-                    + p
-                    + "\n",
-                )
-
-        self.listbox.config(
-            state=tk.DISABLED
-        )
-
-        self.listbox.see(
-            tk.END
-        )
-
-        total_files = 0
-        total_size = 0
-
-        for p in self.selected_paths:
-
-            if os.path.isfile(
-                p
-            ):
-
-                total_files += 1
-
+if GUI_AVAILABLE:
+
+    class AESCryptoApp:
+
+        def __init__(self, root):
+            self.root = root
+            self.root.title(f"AES Crypto Tool v{APP_VERSION}")
+            self.root.geometry("700x580")
+            
+            # Notebook (Tabs) erstellen
+            self.notebook = ttk.Notebook(self.root)
+            self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
+            
+            # Reiter 1: Datei-Verschlüsselung mit Drag-and-Drop
+            self.tab_files = ttk.Frame(self.notebook)
+            self.notebook.add(self.tab_files, text="Dateien / Ordner")
+            self.setup_files_tab()
+
+            # Reiter 2: Text-Verschlüsselung
+            self.tab_text = ttk.Frame(self.notebook)
+            self.notebook.add(self.tab_text, text="Text Verschlüsselung")
+            self.setup_text_tab()
+
+        def setup_files_tab(self):
+            info_label = ttk.Label(self.tab_files, text="Wähle Dateien/Ordner aus oder ziehe sie per Drag & Drop hierher:", padding=10)
+            info_label.pack(anchor="w")
+
+            btn_frame = ttk.Frame(self.tab_files, padding=10)
+            btn_frame.pack(fill="x")
+
+            ttk.Button(btn_frame, text="Dateien hinzufügen", command=self.add_files).pack(side="left", padx=5)
+            ttk.Button(btn_frame, text="Ordner hinzufügen", command=self.add_folder).pack(side="left", padx=5)
+            ttk.Button(btn_frame, text="Liste leeren", command=self.clear_list).pack(side="left", padx=5)
+
+            # Listbox für Dateipfade
+            list_frame = ttk.Frame(self.tab_files, padding=10)
+            list_frame.pack(fill="both", expand=True)
+
+            self.file_listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED)
+            self.file_listbox.pack(side="left", fill="both", expand=True)
+
+            scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.file_listbox.yview)
+            scrollbar.pack(side="right", fill="y")
+            self.file_listbox.config(yscrollcommand=scrollbar.set)
+
+            # Drag & Drop Bindung aktivieren, falls verfügbar
+            if DND_AVAILABLE:
                 try:
-
-                    total_size += os.path.getsize(
-                        p
-                    )
-
-                except OSError:
+                    self.file_listbox.drop_target_register(DND_FILES)
+                    self.file_listbox.dnd_bind('<<Drop>>', self.on_drop)
+                except Exception:
                     pass
 
-            elif os.path.isdir(
-                p
-            ):
-
-                for root, dirs, files in os.walk(
-                    p,
-                    followlinks=False,
-                ):
-
-                    dirs[:] = [
-                        d
-                        for d in dirs
-                        if not os.path.islink(
-                            os.path.join(
-                                root,
-                                d,
-                            )
-                        )
-                    ]
-
-                    for f in files:
-
-                        fp = os.path.join(
-                            root,
-                            f,
-                        )
-
-                        if os.path.islink(
-                            fp
-                        ):
-                            continue
-
-                        total_files += 1
-
-                        try:
-
-                            total_size += (
-                                os.path.getsize(
-                                    fp
-                                )
-                            )
-
-                        except OSError:
-                            pass
-
-        self.info_var.set(
-            f"{len(self.selected_paths)} "
-            f"Eintrag/Einträge | "
-            f"{total_files} Datei(en) | "
-            f"{self._format_size(total_size)}"
-        )
-
-    def _format_size(
-        self,
-        b,
-    ):
-
-        for u in (
-            "B",
-            "KB",
-            "MB",
-            "GB",
-            "TB",
-        ):
-
-            if b < 1024:
-
-                return (
-                    f"{b:.1f} {u}"
-                )
-
-            b /= 1024
-
-        return (
-            f"{b:.1f} PB"
-        )
-
-    def _add_files(
-        self,
-    ):
-
-        paths = filedialog.askopenfilenames(
-            title="Datei(en) auswählen",
-            filetypes=[
-                (
-                    "Alle Dateien",
-                    "*",
-                ),
-                (
-                    "Verschlüsselte Dateien",
-                    "*.enc",
-                ),
-            ],
-        )
-
-        if paths:
-
-            self._add_paths(
-                paths
-            )
-
-    def _add_folder(
-        self,
-    ):
-
-        path = filedialog.askdirectory(
-            title="Ordner auswählen"
-        )
-
-        if path:
-
-            self._add_paths(
-                [
-                    path
-                ]
-            )
-
-    def _clear_selection(
-        self,
-    ):
-
-        self.selected_paths.clear()
-
-        self._update_listbox()
-
-        self.status_var.set(
-            "Auswahl geleert"
-        )
-
-    # --------------------------------------------------------
-    # Batch
-    # --------------------------------------------------------
-
-    def _run_batch(
-        self,
-    ):
-
-        if self.worker_running:
-            return
-
-        if not self.selected_paths:
-
-            messagebox.showwarning(
-                "Hinweis",
-                "Bitte Dateien/Ordner auswählen "
-                "oder per Drag & Drop ablegen.",
-            )
-
-            return
-
-        entered_password = (
-            self.pass_var.get()
-        )
-
-        if entered_password:
-
-            self._session_password = (
-                entered_password
-            )
-
-        password = (
-            self._session_password
-        )
-
-        if not password:
-
-            messagebox.showwarning(
-                "Hinweis",
-                "Passwort darf nicht leer sein.",
-            )
-
-            return
-
-        self.pass_var.set(
-            ""
-        )
-
-        self.worker_running = True
-
-        self.action_btn.config(
-            state=tk.DISABLED
-        )
-
-        self.progress[
-            "value"
-        ] = 0
-
-        self.status_var.set(
-            "Sammle Dateien..."
-        )
-
-        selected_snapshot = list(
-            self.selected_paths
-        )
-
-        delete_original = (
-            self.delete_original.get()
-        )
-
-        encrypt_filename = (
-            self.encrypt_filename.get()
-        )
-
-        def worker():
-
-            try:
-
-                files = collect_files(
-                    selected_snapshot
-                )
-
-                if not files:
-
-                    self.queue.put(
-                        (
-                            "error",
-                            "Keine verarbeitbaren Dateien gefunden.",
-                        )
-                    )
-
-                    return
-
-                valid_files = []
-                total_bytes = 0
-
-                for f in files:
-
-                    try:
-
-                        sz = os.path.getsize(
-                            f
-                        )
-
-                        total_bytes += sz
-
-                        valid_files.append(
-                            (
-                                f,
-                                sz,
-                            )
-                        )
-
-                    except OSError:
-                        continue
-
-                if not valid_files:
-
-                    self.queue.put(
-                        (
-                            "error",
-                            "Keine lesbaren Dateien gefunden.",
-                        )
-                    )
-
-                    return
-
-                processed_bytes = 0
-                errors = []
-                success_count = 0
-
-                for (
-                    fpath,
-                    fsize,
-                ) in valid_files:
-
-                    if self.closing:
-                        return
-
-                    mode = (
-                        "decrypt"
-                        if fpath.lower().endswith(
-                            ".enc"
-                        )
-                        else "encrypt"
-                    )
-
-                    self.queue.put(
-                        (
-                            "status",
-                            f"{os.path.basename(fpath)} "
-                            f"({mode})",
-                        )
-                    )
-
-                    current_out = None
-                    output_existed_before = False
-
-                    try:
-
-                        if mode == "encrypt":
-
-                            out_path = (
-                                make_encrypt_output_path(
-                                    fpath,
-                                    encrypt_filename,
-                                )
-                            )
-
-                        else:
-
-                            out_path = (
-                                make_decrypt_output_path(
-                                    fpath,
-                                    password,
-                                )
-                            )
-
-                        output_existed_before = (
-                            os.path.lexists(
-                                out_path
-                            )
-                        )
-
-                        current_out = out_path
-
-                        def file_progress(
-                            cur,
-                            tot,
-                            base=processed_bytes,
-                        ):
-
-                            if total_bytes <= 0:
-
-                                pct = 0
-
-                            else:
-
-                                pct = int(
-                                    (
-                                        base
-                                        + cur
-                                    )
-                                    / total_bytes
-                                    * 100
-                                )
-
-                            self.queue.put(
-                                (
-                                    "progress",
-                                    min(
-                                        100,
-                                        max(
-                                            0,
-                                            pct,
-                                        ),
-                                    ),
-                                )
-                            )
-
-                        if mode == "encrypt":
-
-                            encrypt_file(
-                                fpath,
-                                out_path,
-                                password,
-                                file_progress,
-                            )
-
-                        else:
-
-                            decrypt_file(
-                                fpath,
-                                out_path,
-                                password,
-                                file_progress,
-                            )
-
-                        if delete_original:
-
-                            try:
-
-                                delete_original_file(
-                                    fpath
-                                )
-
-                            except Exception as delete_error:
-
-                                errors.append(
-                                    f"{fpath}: Verarbeitung "
-                                    f"erfolgreich, Original konnte "
-                                    f"nicht entfernt werden: "
-                                    f"{delete_error}"
-                                )
-
-                        processed_bytes += (
-                            fsize
-                        )
-
-                        success_count += 1
-
-                        self.queue.put(
-                            (
-                                "progress",
-                                min(
-                                    100,
-                                    int(
-                                        processed_bytes
-                                        / total_bytes
-                                        * 100
-                                    ),
-                                ),
-                            )
-                        )
-
-                    except Exception as e:
-
-                        errors.append(
-                            f"{fpath}: {e}"
-                        )
-
-                        if (
-                            current_out
-                            and not output_existed_before
-                            and os.path.exists(
-                                current_out
-                            )
-                        ):
-
-                            try:
-
-                                os.remove(
-                                    current_out
-                                )
-
-                            except OSError:
-                                pass
-
-                msg = (
-                    f"{success_count}/"
-                    f"{len(valid_files)} "
-                    f"erfolgreich verarbeitet."
-                )
-
-                if errors:
-
-                    msg += (
-                        "\n\n"
-                        f"{len(errors)} "
-                        f"Hinweis(e)/Fehler:\n"
-                        + "\n".join(
-                            errors[:4]
-                        )
-                    )
-
-                    if len(errors) > 4:
-
-                        msg += (
-                            "\n... +"
-                            f"{len(errors) - 4}"
-                            " weitere."
-                        )
-
-                    self.queue.put(
-                        (
-                            "warning",
-                            msg,
-                        )
-                    )
-
+            # Passwort & Optionen
+            opt_frame = ttk.LabelFrame(self.tab_files, text="Einstellungen", padding=10)
+            opt_frame.pack(fill="x", padx=10, pady=10)
+
+            ttk.Label(opt_frame, text="Passwort:").pack(side="left", padx=5)
+            self.file_pwd_entry = ttk.Entry(opt_frame, show="*", width=20)
+            self.file_pwd_entry.pack(side="left", padx=5)
+
+            # Passwort anzeigen Checkbutton (Dateien-Tab)
+            self.file_show_pwd_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                opt_frame, 
+                text="Anzeigen", 
+                variable=self.file_show_pwd_var, 
+                command=self.toggle_file_password_visibility
+            ).pack(side="left", padx=5)
+
+            self.del_orig_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(opt_frame, text="Original löschen", variable=self.del_orig_var).pack(side="left", padx=10)
+
+            self.enc_name_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(opt_frame, text="Dateinamen tarnen", variable=self.enc_name_var).pack(side="left", padx=10)
+
+            # Ausführen-Button
+            ttk.Button(self.tab_files, text="Verarbeitung starten", command=self.start_processing).pack(pady=10)
+
+        def toggle_file_password_visibility(self):
+            if self.file_show_pwd_var.get():
+                self.file_pwd_entry.config(show="")
+            else:
+                self.file_pwd_entry.config(show="*")
+
+        def on_drop(self, event):
+            files = self.root.tk.splitlist(event.data)
+            collected = collect_files(files)
+            for f in collected:
+                if f not in self.file_listbox.get(0, tk.END):
+                    self.file_listbox.insert(tk.END, f)
+
+        def add_files(self):
+            files = filedialog.askopenfilenames(title="Dateien auswählen")
+            for f in files:
+                if f not in self.file_listbox.get(0, tk.END):
+                    self.file_listbox.insert(tk.END, f)
+
+        def add_folder(self):
+            folder = filedialog.askdirectory(title="Ordner auswählen")
+            if folder:
+                collected = collect_files([folder])
+                for f in collected:
+                    if f not in self.file_listbox.get(0, tk.END):
+                        self.file_listbox.insert(tk.END, f)
+
+        def clear_list(self):
+            self.file_listbox.delete(0, tk.END)
+
+        def start_processing(self):
+            pwd = self.file_pwd_entry.get()
+            paths = list(self.file_listbox.get(0, tk.END))
+
+            if not pwd:
+                messagebox.showerror("Fehler", "Bitte gib ein Passwort ein.")
+                return
+            if not paths:
+                messagebox.showerror("Fehler", "Keine Dateien ausgewählt.")
+                return
+
+            success_count = 0
+            error_msgs = []
+
+            for path in paths:
+                success, msg = process_single(path, pwd, self.del_orig_var.get(), self.enc_name_var.get())
+                if success:
+                    success_count += 1
                 else:
+                    error_msgs.append(msg)
 
-                    self.queue.put(
-                        (
-                            "success",
-                            msg,
-                        )
-                    )
+            if error_msgs:
+                messagebox.showwarning("Fertig mit Hinweisen", f"Erfolgreich: {success_count}\nFehler:\n" + "\n".join(error_msgs))
+            else:
+                messagebox.showinfo("Erfolg", f"Alle {success_count} Elemente wurden erfolgreich verarbeitet!")
 
+        def setup_text_tab(self):
+            pwd_frame = ttk.LabelFrame(self.tab_text, text="Passwort", padding=10)
+            pwd_frame.pack(fill="x", padx=10, pady=10)
+            
+            ttk.Label(pwd_frame, text="Passwort:").pack(side="left", padx=5)
+            self.text_pwd_entry = ttk.Entry(pwd_frame, show="*", width=25)
+            self.text_pwd_entry.pack(side="left", padx=5, fill="x", expand=True)
+            
+            # Passwort anzeigen Checkbutton (Text-Tab)
+            self.text_show_pwd_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                pwd_frame, 
+                text="Anzeigen", 
+                variable=self.text_show_pwd_var, 
+                command=self.toggle_text_password_visibility
+            ).pack(side="left", padx=5)
+
+            io_frame = ttk.Frame(self.tab_text)
+            io_frame.pack(fill="both", expand=True, padx=10, pady=5)
+            
+            left_pane = ttk.Frame(io_frame)
+            left_pane.pack(side="left", fill="both", expand=True, padx=5)
+            ttk.Label(left_pane, text="Eingabetext (Klartext oder Ciphertext):").pack(anchor="w")
+            self.input_text_area = scrolledtext.ScrolledText(left_pane, height=10, width=30)
+            self.input_text_area.pack(fill="both", expand=True, pady=5)
+            
+            btn_pane = ttk.Frame(io_frame)
+            btn_pane.pack(side="left", fill="y", padx=5, pady=20)
+            
+            ttk.Button(btn_pane, text="Ver-/Entschlüsseln", command=self.on_process_text).pack(fill="x", pady=5)
+            
+            right_pane = ttk.Frame(io_frame)
+            right_pane.pack(side="left", fill="both", expand=True, padx=5)
+            ttk.Label(right_pane, text="Ergebnis:").pack(anchor="w")
+            self.output_text_area = scrolledtext.ScrolledText(right_pane, height=10, width=30)
+            self.output_text_area.pack(fill="both", expand=True, pady=5)
+            
+            # Untere Steuerungsleiste (Kopieren & Felder leeren)
+            action_frame = ttk.Frame(self.tab_text)
+            action_frame.pack(fill="x", padx=10, pady=10)
+            
+            ttk.Button(action_frame, text="Ergebnis in Zwischenablage kopieren", command=self.copy_to_clipboard).pack(side="left", fill="x", expand=True, padx=(0, 5))
+            ttk.Button(action_frame, text="Felder leeren", command=self.clear_text_fields).pack(side="right", padx=(5, 0))
+
+        def toggle_text_password_visibility(self):
+            if self.text_show_pwd_var.get():
+                self.text_pwd_entry.config(show="")
+            else:
+                self.text_pwd_entry.config(show="*")
+
+        def on_encrypt_text(self):
+            pwd = self.text_pwd_entry.get()
+            text = self.input_text_area.get("1.0", tk.END).strip()
+            if not pwd:
+                messagebox.showerror("Fehler", "Bitte gib ein Passwort ein.")
+                return
+            if not text:
+                messagebox.showerror("Fehler", "Bitte gib einen Text zum Verschlüsseln ein.")
+                return
+            try:
+                encrypted = encrypt_text(text, pwd)
+                self.output_text_area.delete("1.0", tk.END)
+                self.output_text_area.insert("1.0", encrypted)
             except Exception as e:
+                messagebox.showerror("Fehler bei der Verschlüsselung", str(e))
 
-                self.queue.put(
-                    (
-                        "error",
-                        f"Unerwarteter Fehler: {e}",
-                    )
-                )
+        def on_process_text(self):
+            pwd = self.text_pwd_entry.get()
+            text = self.input_text_area.get("1.0", tk.END).strip()
+            if not pwd:
+                messagebox.showerror("Fehler", "Bitte gib ein Passwort ein.")
+                return
+            if not text:
+                messagebox.showerror("Fehler", "Bitte gib einen Text ein.")
+                return
 
-        threading.Thread(
-            target=worker,
-            daemon=True,
-        ).start()
+            # AESCRYPT2-Textdaten sind Base64-kodiert und beginnen nach
+            # dem Decodieren mit dem AESCRYPT2-Magic. Nur dann wird
+            # automatisch entschlüsselt; alles andere wird als Klartext
+            # behandelt und verschlüsselt.
+            try:
+                payload = base64.b64decode(text.encode("utf-8"), validate=True)
+                is_ciphertext = payload.startswith(MAGIC)
+            except Exception:
+                is_ciphertext = False
 
-    # --------------------------------------------------------
-    # Queue
-    # --------------------------------------------------------
+            if is_ciphertext:
+                try:
+                    result = decrypt_text(text, pwd)
+                    self.output_text_area.delete("1.0", tk.END)
+                    self.output_text_area.insert("1.0", result)
+                except Exception as e:
+                    messagebox.showerror("Fehler bei der Entschlüsselung", str(e))
+            else:
+                try:
+                    result = encrypt_text(text, pwd)
+                    self.output_text_area.delete("1.0", tk.END)
+                    self.output_text_area.insert("1.0", result)
+                except Exception as e:
+                    messagebox.showerror("Fehler bei der Verschlüsselung", str(e))
 
-    def _process_queue(
-        self,
-    ):
+        def on_decrypt_text(self):
+            pwd = self.text_pwd_entry.get()
+            text = self.input_text_area.get("1.0", tk.END).strip()
+            if not pwd:
+                messagebox.showerror("Fehler", "Bitte gib ein Passwort ein.")
+                return
+            if not text:
+                messagebox.showerror("Fehler", "Bitte gib einen Ciphertext ein.")
+                return
+            try:
+                decrypted = decrypt_text(text, pwd)
+                self.output_text_area.delete("1.0", tk.END)
+                self.output_text_area.insert("1.0", decrypted)
+            except Exception as e:
+                messagebox.showerror("Fehler bei der Entschlüsselung", str(e))
 
-        if self.closing:
-            return
+        def copy_to_clipboard(self):
+            result_text = self.output_text_area.get("1.0", tk.END).strip()
+            if result_text:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(result_text)
+                messagebox.showinfo("Erfolg", "Ergebnis wurde in die Zwischenablage kopiert.")
+            else:
+                messagebox.showwarning("Warnung", "Kein Text zum Kopieren vorhanden.")
 
-        try:
-
-            while True:
-
-                msg_type, msg = (
-                    self.queue.get_nowait()
-                )
-
-                if msg_type == "progress":
-
-                    self.progress[
-                        "value"
-                    ] = msg
-
-                elif msg_type == "status":
-
-                    self.status_var.set(
-                        msg
-                    )
-
-                elif msg_type == "success":
-
-                    self.status_var.set(
-                        "Fertig"
-                    )
-
-                    messagebox.showinfo(
-                        "Erfolg",
-                        msg,
-                    )
-
-                    self._reset_ui()
-
-                elif msg_type == "warning":
-
-                    self.status_var.set(
-                        "Fertig mit Hinweisen"
-                    )
-
-                    messagebox.showwarning(
-                        "Hinweis",
-                        msg,
-                    )
-
-                    self._reset_ui()
-
-                elif msg_type == "error":
-
-                    self.status_var.set(
-                        "Fehler"
-                    )
-
-                    messagebox.showerror(
-                        "Fehler",
-                        msg,
-                    )
-
-                    self._reset_ui()
-
-        except queue.Empty:
-            pass
-
-        try:
-
-            self.root.after(
-                100,
-                self._process_queue,
-            )
-
-        except tk.TclError:
-            pass
-
-    def _reset_ui(
-        self,
-    ):
-
-        if self.closing:
-            return
-
-        self.worker_running = False
-
-        self.action_btn.config(
-            state=tk.NORMAL
-        )
-
-        self.progress[
-            "value"
-        ] = 0
-
-        self.status_var.set(
-            "Bereit"
-        )
-
-        self._update_listbox()
-
+        def clear_text_fields(self):
+            self.text_pwd_entry.delete(0, tk.END)
+            self.input_text_area.delete("1.0", tk.END)
+            self.output_text_area.delete("1.0", tk.END)
 
 # ============================================================
-# Drop Path Parsing
+# Main Entry Point (CLI & GUI Support)
 # ============================================================
 
-def normalize_dropped_path(
-    raw,
-):
-
-    if raw is None:
-        return ""
-
-    p = str(
-        raw
-    ).strip().strip(
-        "\r\n"
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        prog="aescrypto-cli",
+        description="AES Datei- und Text-Verschlüsselungstool",
     )
-
-    if not p:
-        return ""
-
-    if (
-        len(p) >= 2
-        and p[0] == "{"
-        and p[-1] == "}"
-    ):
-
-        p = p[1:-1]
-
-    if (
-        len(p) >= 2
-        and p[0] == '"'
-        and p[-1] == '"'
-    ):
-
-        p = p[1:-1]
-
-    if p.lower().startswith(
-        "file://"
-    ):
-
-        parsed = urlparse(
-            p
-        )
-
-        path = unquote(
-            parsed.path
-        )
-
-        if (
-            parsed.netloc
-            and parsed.netloc.lower()
-            not in (
-                "localhost",
-                "",
-            )
-        ):
-
-            path = (
-                f"//{parsed.netloc}"
-                f"{path}"
-            )
-
-        if (
-            os.name == "nt"
-            and re.match(
-                r"^/[A-Za-z]:",
-                path,
-            )
-        ):
-
-            path = path[1:]
-
-        p = path
-
-    return (
-        os.path.normpath(
-            p
-        )
-        if p
-        else ""
-    )
+    parser.add_argument("paths", nargs="*", help="Dateien oder Ordner für die Verarbeitung")
+    parser.add_argument("-t", "--text", help="Text der ver- oder entschlüsselt werden soll")
+    parser.add_argument("-d", "--decrypt", action="store_true", help="Entschlüsseln Modus (für Text)")
+    parser.add_argument("--delete", action="store_true", help="Originaldatei nach Verarbeitung löschen")
+    parser.add_argument("--enc-name", action="store_true", help="Dateinamen tarnen")
+    parser.add_argument("--version", action="version", version=f"AES Crypto Tool {APP_VERSION}")
+    return parser
 
 
-def split_tcl_droplist(
-    data,
-):
-
-    items = []
-    buf = []
-    in_brace = False
-
-    for ch in data:
-
-        if (
-            ch == "{"
-            and not in_brace
-            and not buf
-        ):
-
-            in_brace = True
-
-        elif (
-            ch == "}"
-            and in_brace
-        ):
-
-            in_brace = False
-
-            items.append(
-                "".join(
-                    buf
-                )
-            )
-
-            buf = []
-
-        elif (
-            ch in " \t\r\n"
-            and not in_brace
-        ):
-
-            if buf:
-
-                items.append(
-                    "".join(
-                        buf
-                    )
-                )
-
-                buf = []
-
-        else:
-
-            buf.append(
-                ch
-            )
-
-    if buf:
-
-        items.append(
-            "".join(
-                buf
-            )
-        )
-
-    return [
-        i
-        for i in items
-        if i
-    ]
+def _stdin_is_interactive():
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        return False
 
 
-# ============================================================
-# Root
-# ============================================================
+def read_cli_password():
+    if _stdin_is_interactive():
+        return getpass.getpass("Passwort: ")
+    if sys.stdin is None:
+        raise RuntimeError("Kein Passwort verfügbar (keine Konsoleneingabe möglich).")
+    line = sys.stdin.readline()
+    if not line:
+        raise RuntimeError("Kein Passwort über stdin erhalten.")
+    return line.rstrip("\r\n")
 
-def create_root():
 
-    global DND_AVAILABLE
+def run_cli(argv=None):
+    """Reiner CLI-Einstiegspunkt für aes_cli.py (Konsolen-Build).
+    Startet niemals die GUI und liefert einen Exit-Code zurück."""
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
 
-    if DND_AVAILABLE:
+    if not args.paths and args.text is None:
+        parser.print_help()
+        return 2
 
+    try:
+        password = read_cli_password()
+    except Exception as e:
+        print(f"Fehler: {e}", file=sys.stderr)
+        return 1
+
+    if not password:
+        print("Fehler: Passwort darf nicht leer sein.", file=sys.stderr)
+        return 1
+
+    if args.text is not None:
         try:
-
-            return TkinterDnD.Tk()
-
+            if args.decrypt:
+                result = decrypt_text(args.text, password)
+            else:
+                result = encrypt_text(args.text, password)
         except Exception as e:
+            print(f"Fehler: {e}", file=sys.stderr)
+            return 1
+        print(result)
+        return 0
 
-            print(
-                f"Drag&Drop-Backend nicht ladbar: {e}"
-            )
+    files = collect_files(args.paths)
+    if not files:
+        print("Fehler: Keine passenden Dateien gefunden.", file=sys.stderr)
+        return 1
 
-            DND_AVAILABLE = False
+    failed = 0
+    for f in files:
+        success, msg = process_single(f, password, args.delete, args.enc_name)
+        if success:
+            print(msg)
+        else:
+            failed += 1
+            print(msg, file=sys.stderr)
 
-    return tk.Tk()
+    return 1 if failed else 0
 
 
-# ============================================================
-# Main
-# ============================================================
+def run_gui():
+    """GUI-Einstiegspunkt für den --windowed Build."""
+    if not GUI_AVAILABLE:
+        return 1
+    root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
+    AESCryptoApp(root)
+    root.mainloop()
+    return 0
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv:
+        return run_cli(argv)
+    return run_gui()
+
 
 if __name__ == "__main__":
-
     multiprocessing.freeze_support()
-
-    cli_args = sys.argv[1:]
-
-    preload_paths = []
-
-    if cli_args:
-
-        if all(
-            (
-                not a.startswith("-")
-                and os.path.exists(a)
-            )
-            for a in cli_args
-        ):
-
-            preload_paths = [
-                os.path.abspath(
-                    a
-                )
-                for a in cli_args
-            ]
-
-        else:
-
-            run_cli()
-
-            sys.exit(0)
-
-    if not GUI_AVAILABLE:
-
-        print(
-            "GUI-Abhängigkeiten fehlen."
-        )
-
-        print(
-            "Installiere:"
-        )
-
-        print(
-            "pip install pystray Pillow "
-            "cryptography tkinterdnd2"
-        )
-
-        sys.exit(1)
-
-    if sys.platform == "win32":
-
-        try:
-
-            from ctypes import windll
-
-            windll.shcore.SetProcessDpiAwareness(
-                1
-            )
-
-        except Exception:
-            pass
-
-    _instance_lock_file = None
-
-    if sys.platform.startswith(
-        "linux"
-    ):
-
-        _runtime_dir = os.environ.get(
-            "XDG_RUNTIME_DIR"
-        )
-
-        if (
-            _runtime_dir
-            and os.path.isdir(
-                _runtime_dir
-            )
-        ):
-
-            lock_dir = _runtime_dir
-
-        else:
-
-            lock_dir = tempfile.gettempdir()
-
-        lock_path = os.path.join(
-            lock_dir,
-            "aescrypto-gui.lock",
-        )
-
-        try:
-
-            _instance_lock_file = open(
-                lock_path,
-                "w",
-            )
-
-            fcntl.flock(
-                _instance_lock_file.fileno(),
-                fcntl.LOCK_EX
-                | fcntl.LOCK_NB,
-            )
-
-        except (
-            OSError,
-            IOError,
-        ):
-
-            try:
-
-                if (
-                    _instance_lock_file
-                    is not None
-                ):
-
-                    _instance_lock_file.close()
-
-            except Exception:
-                pass
-
-            print(
-                "AES Crypto läuft bereits."
-            )
-
-            sys.exit(0)
-
-    root = create_root()
-
-    app = CryptoGUI(
-        root,
-        initial_paths=preload_paths,
-    )
-
-    root.mainloop()
+    raise SystemExit(main())
