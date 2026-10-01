@@ -138,6 +138,7 @@ jobs:
             --onefile `
             --windowed `
             --icon="$PWD\aescrypto.ico" `
+            --add-data "aescrypto.ico;." `
             --collect-submodules tkinterdnd2 `
             --hidden-import=pystray._win32 `
             --name aescrypto `
