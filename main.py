@@ -1014,6 +1014,20 @@ def create_shield_icon(size=64):
 
 
 # ============================================================
+# Fenster-Icon
+# ============================================================
+
+def get_app_icon_path():
+    """Pfad zum aescrypto.ico ermitteln – auch bei PyInstaller-Builds."""
+    if getattr(sys, "frozen", False):
+        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    return os.path.join(base_dir, "aescrypto.ico")
+
+
+# ============================================================
 # Grafische Benutzeroberfläche (GUI)
 # ============================================================
 
@@ -1034,8 +1048,24 @@ if GUI_AVAILABLE:
 
             # Fenster-Icon
             try:
-                self.window_icon = create_shield_icon(64)
-                self.root.iconphoto(False, self.window_icon)
+                self.window_icon = None
+                icon_path = get_app_icon_path()
+
+                if os.path.isfile(icon_path):
+                    if sys.platform.startswith("win"):
+                        # Windows-Titelleiste: echtes .ico verwenden
+                        self.root.iconbitmap(icon_path)
+                    else:
+                        # Auf Linux/macOS .ico über Pillow als Tk-Bild laden
+                        from PIL import ImageTk
+                        icon_image = Image.open(icon_path)
+                        self.window_icon = ImageTk.PhotoImage(icon_image)
+                        self.root.iconphoto(False, self.window_icon)
+                else:
+                    # Fallback, falls aescrypto.ico nicht vorhanden ist
+                    self.window_icon = create_shield_icon(64)
+                    self.root.iconphoto(False, self.window_icon)
+
             except Exception:
                 self.window_icon = None
 
