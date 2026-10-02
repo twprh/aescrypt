@@ -1,4 +1,4 @@
-Übersichtliche Darstellung des Dateiaufbaus als tabellarische Übersicht:
+Darstellung des Dateiaufbaus als tabellarische Übersicht:
 
 ---
 
