@@ -24,18 +24,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, scrolledtext
-
-    # Unter Linux wird bewusst KEIN Tray-Modul geladen.
-    if not sys.platform.startswith("linux"):
-        import pystray
-        from pystray import MenuItem as item
-
     from PIL import Image, ImageDraw
 
     GUI_AVAILABLE = True
 
 except ImportError:
     GUI_AVAILABLE = False
+
+
+# Tray ist optional. Fehlt pystray, bleibt die normale GUI trotzdem verfügbar.
+PYSTRAY_AVAILABLE = False
+if GUI_AVAILABLE and not sys.platform.startswith("linux"):
+    try:
+        import pystray
+        from pystray import MenuItem as item
+        PYSTRAY_AVAILABLE = True
+    except ImportError:
+        PYSTRAY_AVAILABLE = False
 
 
 try:
@@ -81,6 +86,7 @@ V3_FILE_SIZE_SIZE = 8
 V3_CHUNK_COUNT_SIZE = 8
 V3_RECORD_HEADER_SIZE = 8 + 4 + 4
 MAX_V3_CHUNK_SIZE = 64 * 1024 * 1024
+MAX_V3_CHUNK_COUNT = 0xFFFFFFFF
 
 # Scrypt ist speicherhart und erschwert Offline-Passwortangriffe.
 SCRYPT_N = 2**16
@@ -156,7 +162,7 @@ def build_v3_header(salt: bytes, base_nonce: bytes, file_size: int, data_chunk_c
         raise ValueError("Ungültige Nonce-Länge.")
     if not 0 <= file_size <= 0xFFFFFFFFFFFFFFFF:
         raise ValueError("Datei ist zu groß für das AESCRYPT3-Format.")
-    if not 0 <= data_chunk_count <= 0xFFFFFFFFFFFFFFFF:
+    if not 0 <= data_chunk_count <= MAX_V3_CHUNK_COUNT:
         raise ValueError("Zu viele Chunks.")
 
     return (
@@ -199,6 +205,8 @@ def read_v3_header(fin):
         raise ValueError("Ungültige AESCRYPT3-Chunk-Größe.")
 
     expected_count = (file_size + chunk_size - 1) // chunk_size if file_size else 0
+    if expected_count > MAX_V3_CHUNK_COUNT:
+        raise ValueError("AESCRYPT3-Datei enthält zu viele Chunks.")
     if data_chunk_count != expected_count:
         raise ValueError("Ungültige AESCRYPT3-Chunk-Anzahl.")
 
@@ -218,7 +226,7 @@ def read_v3_header(fin):
 def build_v3_nonce(base_nonce: bytes, chunk_index: int) -> bytes:
     if len(base_nonce) != NONCE_SIZE:
         raise ValueError("Ungültige Nonce-Länge.")
-    if not 0 <= chunk_index <= 0xFFFFFFFF:
+    if not 0 <= chunk_index <= MAX_V3_CHUNK_COUNT:
         raise ValueError("Zu viele Chunks für AES-GCM-Nonce.")
     return base_nonce[:8] + chunk_index.to_bytes(4, "big")
 
@@ -1076,8 +1084,8 @@ if GUI_AVAILABLE:
             self.notebook.add(self.tab_text, text="Text Verschlüsselung")
             self.setup_text_tab()
 
-            # Tray nur auf Nicht-Linux-Systemen starten
-            if not sys.platform.startswith("linux"):
+            # Tray nur starten, wenn pystray verfügbar ist.
+            if PYSTRAY_AVAILABLE:
                 self.start_tray()
 
         # ====================================================
@@ -1086,7 +1094,7 @@ if GUI_AVAILABLE:
 
         def start_tray(self):
             # Unter Linux niemals einen Tray starten.
-            if not GUI_AVAILABLE or sys.platform.startswith("linux"):
+            if not GUI_AVAILABLE or not PYSTRAY_AVAILABLE:
                 return
 
             try:
@@ -1258,7 +1266,13 @@ if GUI_AVAILABLE:
             ttk.Checkbutton(opt_frame, text="Dateinamen tarnen", variable=self.enc_name_var).pack(side="left", padx=10)
 
             # Ausführen-Button
-            ttk.Button(self.tab_files, text="Verarbeitung starten", command=self.start_processing).pack(pady=10)
+            self.processing_button = ttk.Button(
+                self.tab_files,
+                text="Verarbeitung starten",
+                command=self.start_processing,
+            )
+            self.processing_button.pack(pady=10)
+            self.processing = False
 
         def toggle_file_password_visibility(self):
             if self.file_show_pwd_var.get():
@@ -1270,12 +1284,6 @@ if GUI_AVAILABLE:
             files = self.root.tk.splitlist(event.data)
             collected = collect_files(files)
             for f in collected:
-                if f not in self.file_listbox.get(0, tk.END):
-                    self.file_listbox.insert(tk.END, f)
-
-        def add_files(self):
-            files = filedialog.askopenfilenames(title="Dateien auswählen", filetypes=[("Verschlüsselte Dateien", "*.enc")])
-            for f in files:
                 if f not in self.file_listbox.get(0, tk.END):
                     self.file_listbox.insert(tk.END, f)
 
@@ -1313,20 +1321,64 @@ if GUI_AVAILABLE:
                 messagebox.showerror("Fehler", "Keine Dateien ausgewählt.")
                 return
 
+            self.processing = True
+            self.processing_button.config(state="disabled")
+
+            delete_original = self.del_orig_var.get()
+            encrypt_filename = self.enc_name_var.get()
+
+            worker = threading.Thread(
+                target=self._process_files_worker,
+                args=(paths, pwd, delete_original, encrypt_filename),
+                name="AESCryptoFileWorker",
+                daemon=True,
+            )
+            worker.start()
+
+        def _process_files_worker(self, paths, password, delete_original, encrypt_filename):
             success_count = 0
             error_msgs = []
 
             for path in paths:
-                success, msg = process_single(path, pwd, self.del_orig_var.get(), self.enc_name_var.get())
+                success, msg = process_single(
+                    path,
+                    password,
+                    delete_original,
+                    encrypt_filename,
+                )
                 if success:
                     success_count += 1
                 else:
                     error_msgs.append(msg)
 
+            try:
+                self.root.after(
+                    0,
+                    self._processing_finished,
+                    success_count,
+                    error_msgs,
+                )
+            except Exception:
+                pass
+
+        def _processing_finished(self, success_count, error_msgs):
+            self.processing = False
+            try:
+                self.processing_button.config(state="normal")
+            except Exception:
+                pass
+
             if error_msgs:
-                messagebox.showwarning("Fertig mit Hinweisen", f"Erfolgreich: {success_count}\nFehler:\n" + "\n".join(error_msgs))
+                messagebox.showwarning(
+                    "Fertig mit Hinweisen",
+                    f"Erfolgreich: {success_count}\nFehler:\n"
+                    + "\n".join(error_msgs),
+                )
             else:
-                messagebox.showinfo("Erfolg", f"Alle {success_count} Elemente wurden erfolgreich verarbeitet!")
+                messagebox.showinfo(
+                    "Erfolg",
+                    f"Alle {success_count} Elemente wurden erfolgreich verarbeitet!",
+                )
 
         # ====================================================
         # Text-Verschlüsselung
@@ -1382,25 +1434,9 @@ if GUI_AVAILABLE:
             else:
                 self.text_pwd_entry.config(show="*")
 
-        def on_encrypt_text(self):
-            pwd = self.text_pwd_entry.get()
-            text = self.input_text_area.get("1.0", tk.END).strip()
-            if not pwd:
-                messagebox.showerror("Fehler", "Bitte gib ein Passwort ein.")
-                return
-            if not text:
-                messagebox.showerror("Fehler", "Bitte gib einen Text zum Verschlüsseln ein.")
-                return
-            try:
-                encrypted = encrypt_text(text, pwd)
-                self.output_text_area.delete("1.0", tk.END)
-                self.output_text_area.insert("1.0", encrypted)
-            except Exception as e:
-                messagebox.showerror("Fehler bei der Verschlüsselung", str(e))
-
         def on_process_text(self):
             pwd = self.text_pwd_entry.get()
-            text = self.input_text_area.get("1.0", tk.END).strip()
+            text = self.input_text_area.get("1.0", "end-1c")
             if not pwd:
                 messagebox.showerror("Fehler", "Bitte gib ein Passwort ein.")
                 return
@@ -1432,22 +1468,6 @@ if GUI_AVAILABLE:
                     self.output_text_area.insert("1.0", result)
                 except Exception as e:
                     messagebox.showerror("Fehler bei der Verschlüsselung", str(e))
-
-        def on_decrypt_text(self):
-            pwd = self.text_pwd_entry.get()
-            text = self.input_text_area.get("1.0", tk.END).strip()
-            if not pwd:
-                messagebox.showerror("Fehler", "Bitte gib ein Passwort ein.")
-                return
-            if not text:
-                messagebox.showerror("Fehler", "Bitte gib einen Ciphertext ein.")
-                return
-            try:
-                decrypted = decrypt_text(text, pwd)
-                self.output_text_area.delete("1.0", tk.END)
-                self.output_text_area.insert("1.0", decrypted)
-            except Exception as e:
-                messagebox.showerror("Fehler bei der Entschlüsselung", str(e))
 
         def copy_to_clipboard(self):
             result_text = self.output_text_area.get("1.0", tk.END).strip()
