@@ -114,6 +114,7 @@ jobs:
             --clean `
             --noconfirm `
             --onefile `
+            --noupx `
             --console `
             --icon="$PWD\aescrypto.ico" `
             --add-data "aescrypto.ico;." `

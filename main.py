@@ -1098,7 +1098,11 @@ if GUI_AVAILABLE:
                 return
 
             try:
-                icon_image = create_shield_icon(64)
+                icon_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "aescrypto.ico",
+                )
+                icon_image = Image.open(icon_path).convert("RGBA")
 
                 menu = pystray.Menu(
                     item(
