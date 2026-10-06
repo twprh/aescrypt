@@ -1218,9 +1218,9 @@ if GUI_AVAILABLE:
 
         def setup_files_tab(self):
             info_label = ttk.Label(self.tab_files, text="Wähle Dateien/Ordner aus oder ziehe sie per Drag & Drop hierher:", padding=10)
-            info_label.pack(anchor="w")
+            info_label.pack(anchor="w", pady=(0, 2))
 
-            btn_frame = ttk.Frame(self.tab_files, padding=10)
+            btn_frame = ttk.Frame(self.tab_files, padding=(10, 4))
             btn_frame.pack(fill="x")
 
             ttk.Button(btn_frame, text="Dateien hinzufügen", command=self.add_files).pack(side="left", padx=5)
@@ -1231,7 +1231,7 @@ if GUI_AVAILABLE:
             # Bewusst kompakt halten, damit Einstellungen, Fortschritt und
             # der Button "Verarbeitung starten" bei der normalen Fenstergröße
             # immer sichtbar bleiben. Die Liste selbst bleibt scrollbar.
-            list_frame = ttk.Frame(self.tab_files, padding=10, height=170)
+            list_frame = ttk.Frame(self.tab_files, padding=(10, 4), height=120)
             list_frame.pack(fill="x", expand=False)
             list_frame.pack_propagate(False)
 
@@ -1252,7 +1252,7 @@ if GUI_AVAILABLE:
 
             # Passwort & Optionen
             opt_frame = ttk.LabelFrame(self.tab_files, text="Einstellungen", padding=10)
-            opt_frame.pack(fill="x", padx=10, pady=10)
+            opt_frame.pack(fill="x", padx=10, pady=5)
 
             ttk.Label(opt_frame, text="Passwort:").pack(side="left", padx=5)
             self.file_pwd_entry = ttk.Entry(opt_frame, show="*", width=20)
@@ -1273,14 +1273,22 @@ if GUI_AVAILABLE:
             self.enc_name_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(opt_frame, text="Dateinamen tarnen", variable=self.enc_name_var).pack(side="left", padx=10)
 
-            # Ausführen-Button
+            # Start-Button bewusst VOR der Fortschrittsanzeige platzieren,
+            # damit er bei der normalen Fenstergröße immer vollständig sichtbar bleibt.
+            self.processing_button = ttk.Button(
+                self.tab_files,
+                text="Verarbeitung starten",
+                command=self.start_processing,
+            )
+            self.processing_button.pack(pady=(2, 6))
+
             # Fortschrittsanzeige
             progress_frame = ttk.LabelFrame(
                 self.tab_files,
                 text="Fortschritt",
                 padding=10,
             )
-            progress_frame.pack(fill="x", padx=10, pady=(0, 10))
+            progress_frame.pack(fill="x", padx=10, pady=(0, 6))
 
             self.progress_status_var = tk.StringVar(value="Bereit")
             ttk.Label(
@@ -1310,13 +1318,6 @@ if GUI_AVAILABLE:
                 anchor="e",
             ).pack(fill="x", pady=(3, 0))
 
-            # Ausführen-Button
-            self.processing_button = ttk.Button(
-                self.tab_files,
-                text="Verarbeitung starten",
-                command=self.start_processing,
-            )
-            self.processing_button.pack(pady=10)
             self.processing = False
 
         def toggle_file_password_visibility(self):
