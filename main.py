@@ -1228,10 +1228,10 @@ if GUI_AVAILABLE:
             ttk.Button(btn_frame, text="Liste leeren", command=self.clear_list).pack(side="left", padx=5)
 
             # Listbox für Dateipfade
-            # Bewusst kompakt halten, damit Einstellungen, Fortschritt und
+            # Kompakt halten, damit Einstellungen, Fortschritt und
             # der Button "Verarbeitung starten" bei der normalen Fenstergröße
             # immer sichtbar bleiben. Die Liste selbst bleibt scrollbar.
-            list_frame = ttk.Frame(self.tab_files, padding=(10, 4), height=120)
+            list_frame = ttk.Frame(self.tab_files, padding=(10, 4), height=190)
             list_frame.pack(fill="x", expand=False)
             list_frame.pack_propagate(False)
 
