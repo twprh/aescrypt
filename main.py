@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
 
 import os
-import re
 import sys
 import secrets
 import struct
 import threading
-import queue
 import argparse
 import multiprocessing
 import getpass
-import io
 import tempfile
 import base64
 
-# Linux GUI: Single-Instance-Sperre
-if sys.platform.startswith("linux"):
-    import fcntl
-
-from urllib.parse import unquote, urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import tkinter as tk
@@ -1041,7 +1032,6 @@ if GUI_AVAILABLE:
             # Tray-Status
             self.tray_icon = None
             self.tray_thread = None
-            self.tray_ready = threading.Event()
             self.exiting = False
 
             # Fenster-Icon
@@ -1145,7 +1135,6 @@ if GUI_AVAILABLE:
 
         def _run_tray(self):
             try:
-                self.tray_ready.set()
                 self.tray_icon.run()
             except Exception as e:
                 try:
@@ -1417,17 +1406,22 @@ if GUI_AVAILABLE:
                 else:
                     error_msgs.append(msg)
 
-                try:
-                    self.root.after(
-                        0,
-                        self._update_progress,
-                        file_index,
-                        total_files,
-                        path,
-                        100,
-                    )
-                except Exception:
-                    pass
+                # Einen fehlgeschlagenen Einzelvorgang nicht als 100 %
+                # darstellen. Bei Erfolg ist der Vorgang bereits durch
+                # den letzten Fortschritts-Callback bei 100 % angekommen;
+                # bei kleinen/0-Byte-Dateien wird hier 100 % gesetzt.
+                if success:
+                    try:
+                        self.root.after(
+                            0,
+                            self._update_progress,
+                            file_index,
+                            total_files,
+                            path,
+                            100,
+                        )
+                    except Exception:
+                        pass
 
             try:
                 self.root.after(
