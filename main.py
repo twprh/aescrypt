@@ -71,7 +71,7 @@ FORMAT_VERSION = 3
 MAGIC_V3 = b"AESCRYPT3"
 FORMAT_VERSION_V3 = 1
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -831,15 +831,15 @@ def make_decrypt_output_path(fpath, password):
         counter += 1
 
 
-def process_single(fpath, password, delete_original, encrypt_filename=False):
+def process_single(fpath, password, delete_original, encrypt_filename=False, progress_cb=None):
     mode = "decrypt" if fpath.lower().endswith(".enc") else "encrypt"
     try:
         if mode == "encrypt":
             out_path = make_encrypt_output_path(fpath, encrypt_filename)
-            encrypt_file(fpath, out_path, password)
+            encrypt_file(fpath, out_path, password, progress_cb=progress_cb)
         else:
             out_path = make_decrypt_output_path(fpath, password)
-            decrypt_file(fpath, out_path, password)
+            decrypt_file(fpath, out_path, password, progress_cb=progress_cb)
 
         if delete_original:
             try:
@@ -1270,6 +1270,43 @@ if GUI_AVAILABLE:
             ttk.Checkbutton(opt_frame, text="Dateinamen tarnen", variable=self.enc_name_var).pack(side="left", padx=10)
 
             # Ausführen-Button
+            # Fortschrittsanzeige
+            progress_frame = ttk.LabelFrame(
+                self.tab_files,
+                text="Fortschritt",
+                padding=10,
+            )
+            progress_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+            self.progress_status_var = tk.StringVar(value="Bereit")
+            ttk.Label(
+                progress_frame,
+                textvariable=self.progress_status_var,
+            ).pack(anchor="w", pady=(0, 5))
+
+            self.progress_file_var = tk.StringVar(value="Keine Verarbeitung aktiv")
+            ttk.Label(
+                progress_frame,
+                textvariable=self.progress_file_var,
+            ).pack(anchor="w", pady=(0, 5))
+
+            self.progress_bar = ttk.Progressbar(
+                progress_frame,
+                orient="horizontal",
+                mode="determinate",
+                maximum=100,
+                value=0,
+            )
+            self.progress_bar.pack(fill="x", expand=True)
+
+            self.progress_percent_var = tk.StringVar(value="0 %")
+            ttk.Label(
+                progress_frame,
+                textvariable=self.progress_percent_var,
+                anchor="e",
+            ).pack(fill="x", pady=(3, 0))
+
+            # Ausführen-Button
             self.processing_button = ttk.Button(
                 self.tab_files,
                 text="Verarbeitung starten",
@@ -1327,6 +1364,10 @@ if GUI_AVAILABLE:
 
             self.processing = True
             self.processing_button.config(state="disabled")
+            self.progress_bar["value"] = 0
+            self.progress_percent_var.set("0 %")
+            self.progress_status_var.set(f"0 / {len(paths)} Dateien verarbeitet")
+            self.progress_file_var.set("Vorbereitung ...")
 
             delete_original = self.del_orig_var.get()
             encrypt_filename = self.enc_name_var.get()
@@ -1342,18 +1383,46 @@ if GUI_AVAILABLE:
         def _process_files_worker(self, paths, password, delete_original, encrypt_filename):
             success_count = 0
             error_msgs = []
+            total_files = len(paths)
 
-            for path in paths:
+            for file_index, path in enumerate(paths, start=1):
+                def progress_cb(processed, total, p=path, idx=file_index):
+                    percent = (processed / total * 100) if total else 100
+                    try:
+                        self.root.after(
+                            0,
+                            self._update_progress,
+                            idx,
+                            total_files,
+                            p,
+                            percent,
+                        )
+                    except Exception:
+                        pass
+
                 success, msg = process_single(
                     path,
                     password,
                     delete_original,
                     encrypt_filename,
+                    progress_cb=progress_cb,
                 )
                 if success:
                     success_count += 1
                 else:
                     error_msgs.append(msg)
+
+                try:
+                    self.root.after(
+                        0,
+                        self._update_progress,
+                        file_index,
+                        total_files,
+                        path,
+                        100,
+                    )
+                except Exception:
+                    pass
 
             try:
                 self.root.after(
@@ -1365,8 +1434,26 @@ if GUI_AVAILABLE:
             except Exception:
                 pass
 
+        def _update_progress(self, file_index, total_files, path, percent):
+            """GUI-sicheres Aktualisieren der Fortschrittsanzeige."""
+            percent = max(0.0, min(100.0, float(percent)))
+            self.progress_bar["value"] = percent
+            self.progress_percent_var.set(f"{percent:.0f} %")
+            self.progress_status_var.set(
+                f"{file_index} / {total_files} Dateien – aktuelle Datei"
+            )
+            self.progress_file_var.set(os.path.basename(path))
+
         def _processing_finished(self, success_count, error_msgs):
             self.processing = False
+            self.progress_bar["value"] = 100 if success_count or not error_msgs else 0
+            self.progress_percent_var.set("100 %" if not error_msgs else "Fertig")
+            self.progress_status_var.set(
+                f"Fertig: {success_count} / {success_count + len(error_msgs)} Dateien erfolgreich"
+            )
+            self.progress_file_var.set(
+                "Verarbeitung abgeschlossen" if not error_msgs else "Mit Fehlern abgeschlossen"
+            )
             try:
                 self.processing_button.config(state="normal")
             except Exception:
