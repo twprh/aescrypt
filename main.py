@@ -1445,14 +1445,10 @@ if GUI_AVAILABLE:
 
         def _processing_finished(self, success_count, error_msgs):
             self.processing = False
-            self.progress_bar["value"] = 100 if success_count or not error_msgs else 0
-            self.progress_percent_var.set("100 %" if not error_msgs else "Fertig")
-            self.progress_status_var.set(
-                f"Fertig: {success_count} / {success_count + len(error_msgs)} Dateien erfolgreich"
-            )
-            self.progress_file_var.set(
-                "Verarbeitung abgeschlossen" if not error_msgs else "Mit Fehlern abgeschlossen"
-            )
+            self.progress_bar["value"] = 0
+            self.progress_percent_var.set("0 %")
+            self.progress_status_var.set("Bereit")
+            self.progress_file_var.set("Keine Verarbeitung aktiv")
             try:
                 self.processing_button.config(state="normal")
             except Exception:
