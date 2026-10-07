@@ -435,7 +435,9 @@ def encrypt_file(input_path, output_path, password, progress_cb=None):
 
                 bytes_read += len(chunk)
                 if progress_cb:
-                    progress_cb(bytes_read, file_size)
+                    should_stop = progress_cb(bytes_read, file_size)
+                    if should_stop is False:
+                        raise InterruptedError("Verarbeitung vom Benutzer gestoppt.")
 
             if bytes_read != file_size:
                 raise ValueError("Dateigröße hat sich während der Verschlüsselung geändert.")
@@ -540,7 +542,9 @@ def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
                     bytes_written += len(plaintext)
 
                     if progress_cb:
-                        progress_cb(bytes_written, file_size)
+                        should_stop = progress_cb(bytes_written, file_size)
+                        if should_stop is False:
+                            raise InterruptedError("Verarbeitung vom Benutzer gestoppt.")
 
                 if bytes_written != file_size:
                     raise ValueError("AESCRYPT3-Dateigröße stimmt nicht mit dem Header überein.")
@@ -611,7 +615,9 @@ def decrypt_file_v2(input_path, output_path, password, progress_cb=None):
                 processed += len(chunk)
                 remaining -= len(chunk)
                 if progress_cb:
-                    progress_cb(processed, ciphertext_size)
+                    should_stop = progress_cb(processed, ciphertext_size)
+                    if should_stop is False:
+                        raise InterruptedError("Verarbeitung vom Benutzer gestoppt.")
 
             try:
                 plaintext.extend(decryptor.finalize())
@@ -839,8 +845,8 @@ def process_single(fpath, password, delete_original, encrypt_filename=False, pro
                 return False, f"{os.path.basename(fpath)}: {mode} erfolgreich, Original konnte nicht entfernt werden."
 
         return True, f"{os.path.basename(fpath)} ({mode})"
-    except Exception as e:
-        return False, f"{os.path.basename(fpath)}: {str(e)}"
+    except InterruptedError:
+        return False, f"{os.path.basename(fpath)}: Verarbeitung gestoppt."
 
 
 # ============================================================
@@ -1308,6 +1314,7 @@ if GUI_AVAILABLE:
             ).pack(fill="x", pady=(3, 0))
 
             self.processing = False
+            self.stop_event = threading.Event()
 
         def toggle_file_password_visibility(self):
             if self.file_show_pwd_var.get():
@@ -1346,6 +1353,11 @@ if GUI_AVAILABLE:
             self.file_listbox.delete(0, tk.END)
 
         def start_processing(self):
+            # Derselbe Button dient während eines laufenden Jobs zum Stoppen.
+            if self.processing:
+                self.stop_processing()
+                return
+
             pwd = self.file_pwd_entry.get()
             paths = list(self.file_listbox.get(0, tk.END))
 
@@ -1357,7 +1369,8 @@ if GUI_AVAILABLE:
                 return
 
             self.processing = True
-            self.processing_button.config(state="disabled")
+            self.stop_event.clear()
+            self.processing_button.config(text="Verarbeitung stoppen", state="normal")
             self.progress_bar["value"] = 0
             self.progress_percent_var.set("0 %")
             self.progress_status_var.set(f"0 / {len(paths)} Dateien verarbeitet")
@@ -1380,7 +1393,13 @@ if GUI_AVAILABLE:
             total_files = len(paths)
 
             for file_index, path in enumerate(paths, start=1):
+                if self.stop_event.is_set():
+                    break
+
                 def progress_cb(processed, total, p=path, idx=file_index):
+                    if self.stop_event.is_set():
+                        return False
+
                     percent = (processed / total * 100) if total else 100
                     try:
                         self.root.after(
@@ -1410,6 +1429,9 @@ if GUI_AVAILABLE:
                 # darstellen. Bei Erfolg ist der Vorgang bereits durch
                 # den letzten Fortschritts-Callback bei 100 % angekommen;
                 # bei kleinen/0-Byte-Dateien wird hier 100 % gesetzt.
+                if self.stop_event.is_set():
+                    break
+
                 if success:
                     try:
                         self.root.after(
@@ -1423,12 +1445,14 @@ if GUI_AVAILABLE:
                     except Exception:
                         pass
 
+            cancelled = self.stop_event.is_set()
             try:
                 self.root.after(
                     0,
                     self._processing_finished,
                     success_count,
                     error_msgs,
+                    cancelled,
                 )
             except Exception:
                 pass
@@ -1443,18 +1467,33 @@ if GUI_AVAILABLE:
             )
             self.progress_file_var.set(os.path.basename(path))
 
-        def _processing_finished(self, success_count, error_msgs):
+        def stop_processing(self):
+            if not self.processing:
+                return
+
+            self.stop_event.set()
+            self.processing_button.config(state="disabled")
+            self.progress_status_var.set("Stop wird ausgeführt ...")
+            self.progress_file_var.set("Aktuelle Datei wird sauber abgebrochen ...")
+
+        def _processing_finished(self, success_count, error_msgs, cancelled=False):
             self.processing = False
             self.progress_bar["value"] = 0
             self.progress_percent_var.set("0 %")
             self.progress_status_var.set("Bereit")
             self.progress_file_var.set("Keine Verarbeitung aktiv")
             try:
-                self.processing_button.config(state="normal")
+                self.processing_button.config(text="Verarbeitung starten", state="normal")
             except Exception:
                 pass
 
-            if error_msgs:
+            if cancelled:
+                messagebox.showinfo(
+                    "Verarbeitung gestoppt",
+                    f"Erfolgreich abgeschlossen: {success_count}\n"
+                    "Die laufende Verarbeitung wurde gestoppt.",
+                )
+            elif error_msgs:
                 messagebox.showwarning(
                     "Fertig mit Hinweisen",
                     f"Erfolgreich: {success_count}\nFehler:\n"
