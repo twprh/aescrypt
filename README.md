@@ -1,4 +1,9 @@
-Darstellung des Dateiaufbaus als tabellarische Übersicht:
+<img width="926" height="682" alt="grafik" src="https://github.com/user-attachments/assets/49eaab4a-d9a6-48ed-885d-3a1bd295174c" />
+
+
+
+
+### Darstellung des Dateiaufbaus als tabellarische Übersicht:
 
 ---
 
