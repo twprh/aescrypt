@@ -3,7 +3,7 @@
 
 """
 AESCrypt3 - Sichere Datei- und Text-Verschlüsselung
-Optimierte Version mit hoher I/O-Performance, Krypto-Agilität und RAM-Zeroizing.
+Vollständige Version inklusive CLI-Schnittstelle, Krypto-Agilität und RAM-Zeroizing.
 """
 
 import os
@@ -14,6 +14,8 @@ import tempfile
 import base64
 import ctypes
 import errno
+import argparse
+import getpass
 from pathlib import Path
 from typing import Optional, Callable, Tuple, Union
 
@@ -33,7 +35,7 @@ FORMAT_VERSION = 2
 MAGIC_V3 = b"AESCRYPT3"
 FORMAT_VERSION_V3 = 1
 
-APP_VERSION = "1.3.2_test"
+APP_VERSION = "1.3.2"
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -865,4 +867,148 @@ def decrypt_file_v2(
                         return
 
                     try:
-                        bytes(prefix[NAME_LEN_SIZE:expected_end]).decode("utf
+                        bytes(prefix[NAME_LEN_SIZE:expected_end]).decode("utf-8")
+                    except UnicodeDecodeError:
+                        raise ValueError("Ungültiger Dateiname.")
+
+                    name_end = expected_end
+                    fout.write(prefix[name_end:])
+                    prefix.clear()
+
+                remaining = ciphertext_size
+                while remaining:
+                    chunk = fin.read(min(CHUNK_SIZE, remaining))
+                    if not chunk:
+                        raise ValueError("Verschlüsselte Datei ist unvollständig.")
+                    consume_plaintext(decryptor.update(chunk))
+                    processed += len(chunk)
+                    remaining -= len(chunk)
+                    if progress_cb:
+                        should_stop = progress_cb(processed, ciphertext_size)
+                        if should_stop is False:
+                            raise InterruptedError("Verarbeitung vom Benutzer gestoppt.")
+
+                try:
+                    consume_plaintext(decryptor.finalize())
+                except InvalidTag:
+                    raise ValueError("Falsches Passwort oder beschädigte Datei.")
+
+                if name_end is None:
+                    raise ValueError(
+                        "Verschlüsselte Datei enthält keinen vollständigen Dateinamen."
+                    )
+
+                fout.flush()
+                os.fsync(fout.fileno())
+
+            install_temp_no_overwrite(tmp_path, out_path)
+            tmp_path = None
+            return out_path
+
+    except Exception:
+        if tmp_fd is not None:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+    finally:
+        if aes_key is not None:
+            zeroize(aes_key)
+
+
+def decrypt_file(
+    input_path: Union[str, Path],
+    output_path: Union[str, Path],
+    password: str,
+    progress_cb: Optional[Callable[[int, int], Optional[bool]]] = None,
+) -> Path:
+    """Automatische Format-Erkennung und Entschlüsselung (AESCRYPT3 oder AESCRYPT2-Legacy)."""
+    in_path = Path(input_path).resolve()
+    if not in_path.exists():
+        raise FileNotFoundError(f"Eingabedatei existiert nicht: {in_path}")
+
+    with in_path.open("rb") as f:
+        magic_v3 = f.read(len(MAGIC_V3))
+        if magic_v3 == MAGIC_V3:
+            return decrypt_file_v3(in_path, output_path, password, progress_cb)
+
+        f.seek(0)
+        magic_v2 = f.read(len(MAGIC))
+        if magic_v2 == MAGIC:
+            return decrypt_file_v2(in_path, output_path, password, progress_cb)
+
+    raise ValueError("Unbekanntes oder ungültiges Dateiformat.")
+
+
+# --- CLI / Einstiegspunkt ---
+
+def print_progress(current: int, total: int) -> Optional[bool]:
+    if total > 0:
+        percent = (current / total) * 100
+        sys.stdout.write(f"\rFortschritt: {percent:.1f}% ({current}/{total} Bytes)")
+        sys.stdout.flush()
+        if current >= total:
+            sys.stdout.write("\n")
+    return True
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=f"AESCrypt CLI {APP_VERSION} - Sichere Datei- & Textverschlüsselung"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # CLI command: encrypt
+    enc_parser = subparsers.add_parser("encrypt", help="Datei verschlüsseln (AESCRYPT3)")
+    enc_parser.add_argument("input", type=str, help="Pfad zur Quelldatei")
+    enc_parser.add_argument("output", type=str, help="Pfad zur Zieldatei")
+    enc_parser.add_argument("-p", "--password", type=str, help="Passwort (optional, sonst interaktive Abfrage)")
+
+    # CLI command: decrypt
+    dec_parser = subparsers.add_parser("decrypt", help="Datei entschlüsseln")
+    dec_parser.add_argument("input", type=str, help="Pfad zur verschlüsselten Datei")
+    dec_parser.add_argument("output", type=str, help="Pfad zur Zieldatei")
+    dec_parser.add_argument("-p", "--password", type=str, help="Passwort (optional, sonst interaktive Abfrage)")
+
+    # CLI command: encrypt-text
+    enc_txt = subparsers.add_parser("encrypt-text", help="Text-String verschlüsseln")
+    enc_txt.add_argument("text", type=str, help="Zu verschlüsselnder Text")
+    enc_txt.add_argument("-p", "--password", type=str, help="Passwort (optional)")
+
+    # CLI command: decrypt-text
+    dec_txt = subparsers.add_parser("decrypt-text", help="Text-String entschlüsseln")
+    dec_txt.add_argument("ciphertext", type=str, help="Base64-kodierter Chiffretext")
+    dec_txt.add_argument("-p", "--password", type=str, help="Passwort (optional)")
+
+    args = parser.parse_args()
+
+    password = args.password
+    if not password:
+        password = getpass.getpass("Passwort eingeben: ")
+
+    try:
+        if args.command == "encrypt":
+            out = encrypt_file(args.input, args.output, password, progress_cb=print_progress)
+            print(f"Erfolgreich verschlüsselt: {out}")
+        elif args.command == "decrypt":
+            out = decrypt_file(args.input, args.output, password, progress_cb=print_progress)
+            print(f"Erfolgreich entschlüsselt: {out}")
+        elif args.command == "encrypt-text":
+            result = encrypt_text(args.text, password)
+            print(f"Chiffretext (Base64):\n{result}")
+        elif args.command == "decrypt-text":
+            result = decrypt_text(args.ciphertext, password)
+            print(f"Entschlüsselter Text:\n{result}")
+    except Exception as e:
+        print(f"\nFehler: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
