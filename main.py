@@ -84,6 +84,13 @@ SCRYPT_N = 2**16
 SCRYPT_R = 8
 SCRYPT_P = 1
 
+# Harte Obergrenzen schützen vor versehentlich überhöhten Parametern.
+# Die aktuellen Werte benötigen ungefähr 64 MiB Arbeitsspeicher.
+SCRYPT_MAX_N = 2**17
+SCRYPT_MAX_R = 16
+SCRYPT_MAX_P = 4
+SCRYPT_MAX_MEMORY_BYTES = 128 * 1024 * 1024
+
 
 # ============================================================
 # Kryptographie (Grundlagen)
@@ -96,6 +103,24 @@ def derive_key(password: str, salt: bytes) -> bytes:
         raise ValueError("Passwort darf nicht leer sein.")
     if len(salt) != SALT_SIZE:
         raise ValueError("Ungültige Salt-Länge.")
+
+    # Diese Parameter stammen aktuell aus der festen Programmkonfiguration,
+    # nicht aus der Datei. Die Prüfung verhindert trotzdem unsichere oder
+    # versehentlich extrem ressourcenintensive Konfigurationswerte.
+    if (not isinstance(SCRYPT_N, int) or SCRYPT_N <= 1 or
+            SCRYPT_N > SCRYPT_MAX_N or SCRYPT_N & (SCRYPT_N - 1)):
+        raise ValueError("Ungültige Scrypt-Konfiguration (N).")
+    if (not isinstance(SCRYPT_R, int) or
+            not 1 <= SCRYPT_R <= SCRYPT_MAX_R):
+        raise ValueError("Ungültige Scrypt-Konfiguration (r).")
+    if (not isinstance(SCRYPT_P, int) or
+            not 1 <= SCRYPT_P <= SCRYPT_MAX_P):
+        raise ValueError("Ungültige Scrypt-Konfiguration (p).")
+
+    # Konservative Speicherabschätzung; vor dem Start der teuren KDF prüfen.
+    estimated_memory = 128 * SCRYPT_N * SCRYPT_R + 256 * SCRYPT_R * SCRYPT_P + 256 * SCRYPT_R
+    if estimated_memory > SCRYPT_MAX_MEMORY_BYTES:
+        raise ValueError("Scrypt-Konfiguration überschreitet das Speicherlimit.")
 
     kdf = Scrypt(
         salt=salt,
