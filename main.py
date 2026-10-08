@@ -64,7 +64,7 @@ FORMAT_VERSION = 3
 MAGIC_V3 = b"AESCRYPT3"
 FORMAT_VERSION_V3 = 1
 
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.2"
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -1087,6 +1087,13 @@ def process_single(fpath, password, delete_original, encrypt_filename=False, pro
         return True, f"{os.path.basename(fpath)} ({mode})"
     except InterruptedError:
         return False, f"{os.path.basename(fpath)}: Verarbeitung gestoppt."
+    except InvalidTag:
+        return False, f"{os.path.basename(fpath)}: Falsches Passwort oder beschädigte Datei."
+    except Exception as exc:
+        # Fehler im Worker müssen als normales Verarbeitungsergebnis zurückkehren;
+        # andernfalls endet der Thread ohne Abschlussmeldung und die GUI bleibt gesperrt.
+        detail = str(exc).strip() or exc.__class__.__name__
+        return False, f"{os.path.basename(fpath)}: {detail}"
 
 
 # ============================================================
