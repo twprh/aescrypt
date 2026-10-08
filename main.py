@@ -334,25 +334,69 @@ def read_v3_chunk(fin, max_chunk_size=MAX_V3_CHUNK_SIZE):
 
 
 def install_temp_no_overwrite(tmp_path, output_path):
+    """Installiert eine temporäre Datei, ohne eine vorhandene Datei zu überschreiben.
+
+    Bevorzugt os.link(), das den Zielnamen atomar und exklusiv anlegt. Wenn
+    Hardlinks auf dem Ziel-Dateisystem nicht unterstützt werden (z. B. bei
+    bestimmten USB-/Netzlaufwerken), wird das Ziel exklusiv mit O_EXCL angelegt
+    und der Inhalt hineinkopiert. Der Fallback verhindert Überschreiben, ist
+    aber nicht atomar sichtbar: Während des Kopierens kann eine unvollständige
+    Zieldatei sichtbar sein. Bei normalen Laufzeitfehlern wird sie entfernt.
+    """
     try:
-        fd = os.open(
-            output_path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-        )
+        os.link(tmp_path, output_path)
     except FileExistsError:
         raise FileExistsError(f"Zieldatei existiert bereits: {output_path}")
-    except OSError as e:
-        raise OSError(f"Zieldatei konnte nicht sicher angelegt werden: {e}")
-    else:
+    except OSError:
+        # Portabler Fallback für Dateisysteme, die keine Hardlinks unterstützen.
+        # O_EXCL schützt vor dem Überschreiben eines bereits vorhandenen Ziels.
+        out_fd = None
+        created_identity = None
         try:
-            os.close(fd)
-            os.replace(tmp_path, output_path)
+            out_fd = os.open(
+                output_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            out_stat = os.fstat(out_fd)
+            created_identity = (out_stat.st_dev, out_stat.st_ino)
+
+            with os.fdopen(out_fd, "wb") as fout:
+                out_fd = None
+                with open(tmp_path, "rb") as fin:
+                    while True:
+                        block = fin.read(CHUNK_SIZE)
+                        if not block:
+                            break
+                        fout.write(block)
+                fout.flush()
+                os.fsync(fout.fileno())
+        except FileExistsError:
+            raise FileExistsError(f"Zieldatei existiert bereits: {output_path}")
         except OSError as e:
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass
-            raise OSError(f"Zieldatei konnte nicht installiert werden: {e}")
+            if out_fd is not None:
+                try:
+                    os.close(out_fd)
+                except OSError:
+                    pass
+            # Nur den von uns angelegten Zielpfad entfernen, nicht einen
+            # zwischenzeitlich ausgetauschten Pfad eines anderen Prozesses.
+            if created_identity is not None:
+                try:
+                    current = os.stat(output_path)
+                    if (current.st_dev, current.st_ino) == created_identity:
+                        os.unlink(output_path)
+                except OSError:
+                    pass
+            raise OSError(f"Zieldatei konnte nicht sicher installiert werden: {e}")
+
+    try:
+        os.unlink(tmp_path)
+    except OSError as e:
+        # Beim Hardlink-Pfad sind Ziel und Quelle dieselbe Datei. Im Fallback
+        # ist das Ziel eine Kopie; beide Dateien bleiben erhalten, falls das
+        # Entfernen der temporären Datei fehlschlägt.
+        raise OSError(f"Temporäre Datei konnte nicht entfernt werden: {e}")
 
 
 # ============================================================
@@ -448,41 +492,50 @@ def encrypt_file(input_path, output_path, password, progress_cb=None):
     )
 
     try:
-        with open(input_path, "rb") as fin, os.fdopen(tmp_fd, "wb") as fout:
-            fout.write(header)
+        # Quelle separat öffnen, damit bei einem Fehler hier der bereits durch
+        # mkstemp() angelegte Dateideskriptor sicher geschlossen werden kann.
+        with open(input_path, "rb") as fin:
+            with os.fdopen(tmp_fd, "wb") as fout:
+                tmp_fd = None
+                fout.write(header)
 
-            # Chunk 0 enthält ausschließlich die verschlüsselten Dateimetadaten.
-            write_v3_chunk(
-                fout, aes_key, base_nonce, header, 0, metadata
-            )
-
-            bytes_read = 0
-            for index in range(1, data_chunk_count + 1):
-                expected = min(CHUNK_SIZE, file_size - bytes_read)
-                chunk = fin.read(expected)
-                if len(chunk) != expected:
-                    raise ValueError("Quelldatei konnte während der Verschlüsselung nicht vollständig gelesen werden.")
-
+                # Chunk 0 enthält ausschließlich die verschlüsselten Dateimetadaten.
                 write_v3_chunk(
-                    fout, aes_key, base_nonce, header, index, chunk
+                    fout, aes_key, base_nonce, header, 0, metadata
                 )
 
-                bytes_read += len(chunk)
-                if progress_cb:
-                    should_stop = progress_cb(bytes_read, file_size)
-                    if should_stop is False:
-                        raise InterruptedError("Verarbeitung vom Benutzer gestoppt.")
+                bytes_read = 0
+                for index in range(1, data_chunk_count + 1):
+                    expected = min(CHUNK_SIZE, file_size - bytes_read)
+                    chunk = fin.read(expected)
+                    if len(chunk) != expected:
+                        raise ValueError("Quelldatei konnte während der Verschlüsselung nicht vollständig gelesen werden.")
 
-            if bytes_read != file_size:
-                raise ValueError("Dateigröße hat sich während der Verschlüsselung geändert.")
+                    write_v3_chunk(
+                        fout, aes_key, base_nonce, header, index, chunk
+                    )
 
-            fout.flush()
-            os.fsync(fout.fileno())
+                    bytes_read += len(chunk)
+                    if progress_cb:
+                        should_stop = progress_cb(bytes_read, file_size)
+                        if should_stop is False:
+                            raise InterruptedError("Verarbeitung vom Benutzer gestoppt.")
+
+                if bytes_read != file_size:
+                    raise ValueError("Dateigröße hat sich während der Verschlüsselung geändert.")
+
+                fout.flush()
+                os.fsync(fout.fileno())
 
         install_temp_no_overwrite(tmp_path, output_path)
         tmp_path = None
 
     except Exception:
+        if tmp_fd is not None:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
         if tmp_path:
             try:
                 os.unlink(tmp_path)
