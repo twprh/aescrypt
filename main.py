@@ -530,6 +530,12 @@ def encrypt_file(input_path, output_path, password, progress_cb=None):
                 if bytes_read != file_size:
                     raise ValueError("Dateigröße hat sich während der Verschlüsselung geändert.")
 
+                # Auch eine während der Verschlüsselung gewachsene Quelldatei
+                # erkennen; andernfalls würden zusätzliche Bytes stillschweigend
+                # nicht in die verschlüsselte Ausgabe übernommen.
+                if fin.read(1):
+                    raise ValueError("Quelldatei ist während der Verschlüsselung gewachsen.")
+
                 fout.flush()
                 os.fsync(fout.fileno())
 
@@ -963,8 +969,12 @@ def make_encrypt_output_path(fpath, encrypt_filename=False):
 def make_decrypt_output_path(fpath, password):
     fpath = os.path.abspath(fpath)
     orig_name = get_original_filename(fpath, password)
+    # Beide üblichen Pfadtrenner unabhängig vom aktuellen Betriebssystem
+    # behandeln, damit fremde/alte Dateien keinen Pfad aus dem Metadatum
+    # in das Ausgabeverzeichnis einschleusen können.
+    orig_name = orig_name.replace("\\", "/")
     orig_name = os.path.basename(orig_name)
-    if not orig_name:
+    if not orig_name or orig_name in (".", "..") or "\x00" in orig_name:
         raise ValueError("Ungültiger Original-Dateiname.")
 
     directory = os.path.dirname(fpath)
