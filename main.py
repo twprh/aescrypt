@@ -274,7 +274,13 @@ def write_v3_chunk(fout, aes_key, base_nonce, header, chunk_index, plaintext):
     fout.write(tag)
 
 
-def read_v3_chunk(fin):
+def read_v3_chunk(fin, max_chunk_size=MAX_V3_CHUNK_SIZE):
+    """Liest einen AESCRYPT3-Chunk erst nach Prüfung seiner Größenangaben.
+
+    max_chunk_size wird vom Aufrufer anhand des Headers bzw. des Chunk-Typs
+    begrenzt. So bleiben gültige AESCRYPT3-Dateien mit größeren, im Format
+    erlaubten Chunks kompatibel, ohne unbeschränktes Einlesen zuzulassen.
+    """
     record_header = fin.read(V3_RECORD_HEADER_SIZE)
     if not record_header:
         return None
@@ -285,7 +291,10 @@ def read_v3_chunk(fin):
         ">QII", record_header
     )
 
-    if ciphertext_size != plaintext_size:
+    # Beide Größen sind nicht vertrauenswürdig: vor fin.read() begrenzen.
+    if (plaintext_size > max_chunk_size or
+            ciphertext_size > max_chunk_size or
+            ciphertext_size != plaintext_size):
         raise ValueError("Ungültige AESCRYPT3-Chunk-Größe.")
 
     ciphertext = fin.read(ciphertext_size)
@@ -488,7 +497,9 @@ def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
 
         try:
             with os.fdopen(tmp_fd, "wb") as fout:
-                first = read_v3_chunk(fin)
+                first = read_v3_chunk(
+                    fin, max_chunk_size=NAME_LEN_SIZE + MAX_NAME_LEN
+                )
                 if first is None:
                     raise ValueError("AESCRYPT3-Datei enthält keine Metadaten.")
 
@@ -519,7 +530,7 @@ def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
                 bytes_written = 0
 
                 for expected_index in range(1, data_chunk_count + 1):
-                    record = read_v3_chunk(fin)
+                    record = read_v3_chunk(fin, max_chunk_size=chunk_size)
                     if record is None:
                         raise ValueError("AESCRYPT3-Datei ist unvollständig.")
 
@@ -688,7 +699,9 @@ def get_original_filename(enc_path, password):
         with open(enc_path, "rb") as fin:
             salt, base_nonce, chunk_size, file_size, data_chunk_count, header = read_v3_header(fin)
             aes_key = derive_key(password, salt)
-            record = read_v3_chunk(fin)
+            record = read_v3_chunk(
+                fin, max_chunk_size=NAME_LEN_SIZE + MAX_NAME_LEN
+            )
             if record is None:
                 raise ValueError("AESCRYPT3-Datei enthält keine Metadaten.")
             index, plain_size, ciphertext, tag = record
