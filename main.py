@@ -581,7 +581,12 @@ def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
 
 
 def decrypt_file_v2(input_path, output_path, password, progress_cb=None):
-    """AESCRYPT2-Legacy-Entschlüsselung. Alte Dateien bleiben lesbar."""
+    """AESCRYPT2-Legacy-Entschlüsselung mit begrenztem Speicherverbrauch.
+
+    Klartext wird während der GCM-Prüfung ausschließlich in eine temporäre
+    Datei geschrieben. Diese wird erst nach erfolgreicher Tag-Prüfung als
+    endgültige Ausgabedatei installiert.
+    """
     input_path = os.path.abspath(input_path)
     output_path = os.path.abspath(output_path)
 
@@ -595,6 +600,7 @@ def decrypt_file_v2(input_path, output_path, password, progress_cb=None):
         raise ValueError("Datei zu klein oder beschädigt.")
 
     tmp_path = None
+    tmp_fd = None
     try:
         with open(input_path, "rb") as fin:
             salt, nonce, header = read_header(fin)
@@ -608,57 +614,80 @@ def decrypt_file_v2(input_path, output_path, password, progress_cb=None):
             if ciphertext_size < NAME_LEN_SIZE + 1:
                 raise ValueError("Ungültige Dateistruktur.")
 
-            aes_key = derive_key(password, salt)
-            cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
-            decryptor = cipher.decryptor()
-            decryptor.authenticate_additional_data(header)
-
-            fin.seek(len(header))
-            plaintext = bytearray()
-            remaining = ciphertext_size
-            processed = 0
-
-            while remaining:
-                chunk = fin.read(min(CHUNK_SIZE, remaining))
-                if not chunk:
-                    raise ValueError("Verschlüsselte Datei ist unvollständig.")
-                plaintext.extend(decryptor.update(chunk))
-                processed += len(chunk)
-                remaining -= len(chunk)
-                if progress_cb:
-                    should_stop = progress_cb(processed, ciphertext_size)
-                    if should_stop is False:
-                        raise InterruptedError("Verarbeitung vom Benutzer gestoppt.")
-
-            try:
-                plaintext.extend(decryptor.finalize())
-            except InvalidTag:
-                raise ValueError("Falsches Passwort oder beschädigte Datei.")
-
-            if len(plaintext) < NAME_LEN_SIZE + 1:
-                raise ValueError("Verschlüsselte Datei enthält keinen gültigen Dateinamen.")
-
-            name_len = struct.unpack(">I", plaintext[:NAME_LEN_SIZE])[0]
-            if name_len == 0 or name_len > MAX_NAME_LEN:
-                raise ValueError("Ungültiges Dateiformat: ungültiger Dateiname.")
-
-            name_end = NAME_LEN_SIZE + name_len
-            if len(plaintext) < name_end:
-                raise ValueError("Verschlüsselte Datei enthält keinen vollständigen Dateinamen.")
-
-            try:
-                bytes(plaintext[NAME_LEN_SIZE:name_end]).decode("utf-8")
-            except UnicodeDecodeError:
-                raise ValueError("Ungültiger Dateiname.")
-
             out_dir = os.path.dirname(output_path) or "."
             os.makedirs(out_dir, exist_ok=True)
             tmp_fd, tmp_path = tempfile.mkstemp(
                 dir=out_dir, prefix=".aescrypto-", suffix=".tmp"
             )
 
+            aes_key = derive_key(password, salt)
+            cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
+            decryptor = cipher.decryptor()
+            decryptor.authenticate_additional_data(header)
+
+            # Nur der kurze Dateinamen-Präfix bleibt im RAM. Die Nutzdaten
+            # gehen in die temporäre Datei; diese wird vor GCM-finalize nie
+            # als gültige Ausgabe sichtbar gemacht.
+            prefix = bytearray()
+            name_end = None
+            processed = 0
+            fin.seek(len(header))
+
             with os.fdopen(tmp_fd, "wb") as fout:
-                fout.write(plaintext[name_end:])
+                tmp_fd = None
+
+                def consume_plaintext(data):
+                    nonlocal name_end
+                    if not data:
+                        return
+                    if name_end is not None:
+                        fout.write(data)
+                        return
+
+                    prefix.extend(data)
+                    if len(prefix) < NAME_LEN_SIZE:
+                        return
+
+                    name_len = struct.unpack(">I", prefix[:NAME_LEN_SIZE])[0]
+                    if name_len == 0 or name_len > MAX_NAME_LEN:
+                        raise ValueError("Ungültiges Dateiformat: ungültiger Dateiname.")
+
+                    expected_end = NAME_LEN_SIZE + name_len
+                    if len(prefix) < expected_end:
+                        return
+
+                    try:
+                        bytes(prefix[NAME_LEN_SIZE:expected_end]).decode("utf-8")
+                    except UnicodeDecodeError:
+                        raise ValueError("Ungültiger Dateiname.")
+
+                    name_end = expected_end
+                    fout.write(prefix[name_end:])
+                    prefix.clear()
+
+                remaining = ciphertext_size
+                while remaining:
+                    chunk = fin.read(min(CHUNK_SIZE, remaining))
+                    if not chunk:
+                        raise ValueError("Verschlüsselte Datei ist unvollständig.")
+                    consume_plaintext(decryptor.update(chunk))
+                    processed += len(chunk)
+                    remaining -= len(chunk)
+                    if progress_cb:
+                        should_stop = progress_cb(processed, ciphertext_size)
+                        if should_stop is False:
+                            raise InterruptedError("Verarbeitung vom Benutzer gestoppt.")
+
+                # finalize() prüft den GCM-Tag. Bis dieser Aufruf erfolgreich
+                # war, bleibt die temporäre Datei unveröffentlicht.
+                try:
+                    consume_plaintext(decryptor.finalize())
+                except InvalidTag:
+                    raise ValueError("Falsches Passwort oder beschädigte Datei.")
+
+                if name_end is None:
+                    raise ValueError("Verschlüsselte Datei enthält keinen vollständigen Dateinamen.")
+
                 fout.flush()
                 os.fsync(fout.fileno())
 
@@ -667,6 +696,11 @@ def decrypt_file_v2(input_path, output_path, password, progress_cb=None):
         return output_path
 
     except Exception:
+        if tmp_fd is not None:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
         if tmp_path:
             try:
                 os.unlink(tmp_path)
