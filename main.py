@@ -764,32 +764,54 @@ def get_original_filename(enc_path, password):
             salt, nonce, header = read_header(fin)
             fin.seek(fsize - TAG_SIZE)
             tag = fin.read(TAG_SIZE)
+            if len(tag) != TAG_SIZE:
+                raise ValueError("Authentifizierungs-Tag fehlt.")
+
             ciphertext_size = fsize - len(header) - TAG_SIZE
             aes_key = derive_key(password, salt)
             cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
             decryptor = cipher.decryptor()
             decryptor.authenticate_additional_data(header)
             fin.seek(len(header))
-            plaintext = bytearray()
+
+            # Nur die für den Dateinamen nötigen Bytes werden behalten.
+            # Die gesamte Datei wird trotzdem verarbeitet, damit GCM den
+            # Authentifizierungs-Tag zuverlässig prüfen kann.
+            prefix = bytearray()
+            expected_prefix_size = NAME_LEN_SIZE
+
+            def collect_name_prefix(data):
+                nonlocal expected_prefix_size
+                offset = 0
+                while offset < len(data) and len(prefix) < expected_prefix_size:
+                    needed = expected_prefix_size - len(prefix)
+                    take = min(needed, len(data) - offset)
+                    prefix.extend(data[offset:offset + take])
+                    offset += take
+
+                    if len(prefix) == NAME_LEN_SIZE and expected_prefix_size == NAME_LEN_SIZE:
+                        name_len = struct.unpack(">I", prefix)[0]
+                        if name_len == 0 or name_len > MAX_NAME_LEN:
+                            raise ValueError("Ungültiges Dateiformat: ungültiger Dateiname.")
+                        expected_prefix_size = NAME_LEN_SIZE + name_len
+
             remaining = ciphertext_size
             while remaining:
                 chunk = fin.read(min(CHUNK_SIZE, remaining))
                 if not chunk:
                     raise ValueError("Verschlüsselte Datei ist unvollständig.")
-                plaintext.extend(decryptor.update(chunk))
+                collect_name_prefix(decryptor.update(chunk))
                 remaining -= len(chunk)
+
             try:
-                plaintext.extend(decryptor.finalize())
+                collect_name_prefix(decryptor.finalize())
             except InvalidTag:
                 raise ValueError("Falsches Passwort oder beschädigte Datei.")
 
-            if len(plaintext) < NAME_LEN_SIZE + 1:
-                raise ValueError("Verschlüsselte Datei enthält keinen gültigen Dateinamen.")
-            name_len = struct.unpack(">I", plaintext[:NAME_LEN_SIZE])[0]
-            if name_len == 0 or name_len > MAX_NAME_LEN or len(plaintext) < NAME_LEN_SIZE + name_len:
-                raise ValueError("Ungültiges Dateiformat: ungültiger Dateiname.")
+            if len(prefix) != expected_prefix_size:
+                raise ValueError("Verschlüsselte Datei enthält keinen vollständigen Dateinamen.")
             try:
-                return bytes(plaintext[NAME_LEN_SIZE:NAME_LEN_SIZE + name_len]).decode("utf-8")
+                return bytes(prefix[NAME_LEN_SIZE:]).decode("utf-8")
             except UnicodeDecodeError:
                 raise ValueError("Ungültiger Dateiname.")
 
