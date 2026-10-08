@@ -427,7 +427,7 @@ def encrypt_text(text: str, password: str) -> str:
 
 def decrypt_text(encoded_payload: str, password: str) -> str:
     try:
-        payload = base64.b64decode(encoded_payload.encode("utf-8"))
+        payload = base64.b64decode(encoded_payload.encode("utf-8"), validate=True)
     except Exception:
         raise ValueError("Ungültiges Base64-Format.")
     
@@ -436,6 +436,12 @@ def decrypt_text(encoded_payload: str, password: str) -> str:
     
     if len(payload) < minimum_size:
         raise ValueError("Daten zu kurz oder beschädigt.")
+
+    # Vor der Schlüsselableitung das erwartete Format explizit prüfen.
+    if payload[:len(MAGIC)] != MAGIC:
+        raise ValueError("Ungültiges oder nicht unterstütztes Dateiformat.")
+    if payload[len(MAGIC)] != FORMAT_VERSION:
+        raise ValueError("Nicht unterstützte Dateiformat-Version.")
         
     header = payload[:header_size]
     salt = header[len(MAGIC) + 1 : len(MAGIC) + 1 + SALT_SIZE]
