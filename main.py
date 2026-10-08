@@ -10,6 +10,8 @@ import multiprocessing
 import getpass
 import tempfile
 import base64
+import ctypes
+import errno
 
 
 try:
@@ -333,23 +335,79 @@ def read_v3_chunk(fin, max_chunk_size=MAX_V3_CHUNK_SIZE):
     return chunk_index, plaintext_size, ciphertext, tag
 
 
-def install_temp_no_overwrite(tmp_path, output_path):
-    """Installiert eine temporäre Datei, ohne eine vorhandene Datei zu überschreiben.
+def _try_atomic_noreplace_rename(tmp_path, output_path):
+    """Versucht eine atomare Umbenennung ohne Überschreiben.
 
-    Bevorzugt os.link(), das den Zielnamen atomar und exklusiv anlegt. Wenn
-    Hardlinks auf dem Ziel-Dateisystem nicht unterstützt werden (z. B. bei
-    bestimmten USB-/Netzlaufwerken), wird das Ziel exklusiv mit O_EXCL angelegt
-    und der Inhalt hineinkopiert. Der Fallback verhindert Überschreiben, ist
-    aber nicht atomar sichtbar: Während des Kopierens kann eine unvollständige
-    Zieldatei sichtbar sein. Bei normalen Laufzeitfehlern wird sie entfernt.
+    Unter Linux wird renameat2(RENAME_NOREPLACE) verwendet. Unter Windows
+    garantiert os.rename(), dass ein vorhandenes Ziel nicht ersetzt wird.
+    False bedeutet, dass die Plattform/das Dateisystem diesen Weg nicht
+    unterstützt; dann darf der Aufrufer einen sicheren Fallback versuchen.
     """
+    if sys.platform.startswith("linux"):
+        try:
+            renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2")
+        except (AttributeError, OSError):
+            return False
+
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                              ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100, os.fsencode(tmp_path), -100, os.fsencode(output_path), 1
+        )  # AT_FDCWD, RENAME_NOREPLACE
+        if result == 0:
+            return True
+
+        error_code = ctypes.get_errno()
+        if error_code == errno.EEXIST:
+            raise FileExistsError(error_code, os.strerror(error_code), output_path)
+        unsupported = {
+            errno.ENOSYS, errno.EINVAL, errno.EXDEV,
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+        }
+        if error_code in unsupported:
+            return False
+        raise OSError(error_code, os.strerror(error_code), output_path)
+
+    if os.name == "nt":
+        try:
+            os.rename(tmp_path, output_path)
+            return True
+        except FileExistsError:
+            raise
+        except OSError:
+            return False
+
+    return False
+
+
+def install_temp_no_overwrite(tmp_path, output_path):
+    """Installiert eine temporäre Datei, ohne ein vorhandenes Ziel zu überschreiben.
+
+    Bevorzugt einen atomaren Hardlink. Wenn das nicht möglich ist, wird eine
+    atomare Umbenennung ohne Überschreiben versucht (Linux/Windows). Nur wenn
+    beides nicht verfügbar ist, wird das Ziel exklusiv angelegt und kopiert.
+    Dieser letzte Fallback ist während des Kopierens sichtbar; bei normalen
+    Laufzeitfehlern wird eine von uns angelegte Teildatei entfernt.
+    """
+    tmp_stat = os.stat(tmp_path)
+    installed_identity = (tmp_stat.st_dev, tmp_stat.st_ino)
+
     try:
         os.link(tmp_path, output_path)
     except FileExistsError:
         raise FileExistsError(f"Zieldatei existiert bereits: {output_path}")
     except OSError:
-        # Portabler Fallback für Dateisysteme, die keine Hardlinks unterstützen.
-        # O_EXCL schützt vor dem Überschreiben eines bereits vorhandenen Ziels.
+        # Rename verschiebt die temporäre Datei atomar und exklusiv, wo
+        # die Plattform das unterstützt. Bei Erfolg existiert tmp_path nicht mehr.
+        try:
+            if _try_atomic_noreplace_rename(tmp_path, output_path):
+                return
+        except FileExistsError:
+            raise FileExistsError(f"Zieldatei existiert bereits: {output_path}")
+
+        # Letzter, kompatibler Fallback für andere Plattformen/Dateisysteme.
         out_fd = None
         created_identity = None
         try:
@@ -360,6 +418,7 @@ def install_temp_no_overwrite(tmp_path, output_path):
             )
             out_stat = os.fstat(out_fd)
             created_identity = (out_stat.st_dev, out_stat.st_ino)
+            installed_identity = created_identity
 
             with os.fdopen(out_fd, "wb") as fout:
                 out_fd = None
@@ -379,29 +438,47 @@ def install_temp_no_overwrite(tmp_path, output_path):
                     os.close(out_fd)
                 except OSError:
                     pass
-            # Nur den von uns angelegten Zielpfad entfernen, nicht einen
-            # zwischenzeitlich ausgetauschten Pfad eines anderen Prozesses.
+            cleanup_note = ""
             if created_identity is not None:
                 try:
                     current = os.stat(output_path)
                     if (current.st_dev, current.st_ino) == created_identity:
                         os.unlink(output_path)
-                except OSError:
+                except FileNotFoundError:
                     pass
-            raise OSError(f"Zieldatei konnte nicht sicher installiert werden: {e}")
+                except OSError as cleanup_error:
+                    cleanup_note = (
+                        f" Die unvollständige Zieldatei konnte nicht entfernt werden: "
+                        f"{cleanup_error}"
+                    )
+            raise OSError(
+                f"Zieldatei konnte nicht sicher installiert werden: {e}.{cleanup_note}"
+            )
 
     try:
         os.unlink(tmp_path)
     except OSError as e:
-        # Beim Hardlink-Pfad sind Ziel und Quelle dieselbe Datei. Im Fallback
-        # ist das Ziel eine Kopie; beide Dateien bleiben erhalten, falls das
-        # Entfernen der temporären Datei fehlschlägt.
-        raise OSError(f"Temporäre Datei konnte nicht entfernt werden: {e}")
+        rollback_note = ""
+        if installed_identity is not None:
+            try:
+                current = os.stat(output_path)
+                if (current.st_dev, current.st_ino) == installed_identity:
+                    os.unlink(output_path)
+                else:
+                    rollback_note = " Das Ziel wurde inzwischen verändert; es blieb unangetastet."
+            except FileNotFoundError:
+                pass
+            except OSError as rollback_error:
+                rollback_note = f" Das Ziel konnte nicht zurückgerollt werden: {rollback_error}"
+        raise OSError(
+            f"Temporäre Datei konnte nicht entfernt werden: {e}.{rollback_note}"
+        )
 
 
 # ============================================================
 # Text-Verschlüsselung
 # ============================================================
+
 
 def encrypt_text(text: str, password: str) -> str:
     if not isinstance(text, str):
