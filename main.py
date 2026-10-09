@@ -1150,9 +1150,40 @@ def get_original_filename(enc_path, password):
     raise ValueError("Ungültiges oder nicht unterstütztes Dateiformat.")
 
 
-def delete_original_file(filepath):
-    if not os.path.lexists(filepath):
+def _file_identity(filepath):
+    """Liefert eine konservative Identität der Datei bzw. des Verzeichniseintrags."""
+    st = os.lstat(filepath)
+    return (
+        st.st_dev,
+        st.st_ino,
+        st.st_mode,
+        st.st_size,
+        st.st_mtime_ns,
+        st.st_ctime_ns,
+    )
+
+
+def delete_original_file(filepath, expected_identity=None):
+    """Löscht das Original nur, wenn es noch dem erfassten Dateiobjekt entspricht.
+
+    Der Identitätsvergleich verhindert insbesondere, dass ein zwischenzeitlich
+    am selben Pfad eingesetzter anderer Dateieintrag versehentlich gelöscht wird.
+    Portable Pfadoperationen können das kleine Zeitfenster zwischen lstat und
+    remove nicht auf allen Betriebssystemen atomar schließen.
+    """
+    try:
+        current_identity = _file_identity(filepath)
+    except FileNotFoundError:
+        if expected_identity is not None:
+            raise RuntimeError("Original fehlt inzwischen; Löschen abgebrochen.")
         return
+
+    if expected_identity is not None and current_identity != expected_identity:
+        raise RuntimeError(
+            "Quelldatei wurde seit Beginn der Verarbeitung ersetzt oder verändert; "
+            "Löschen des Originals aus Sicherheitsgründen abgebrochen."
+        )
+
     try:
         os.remove(filepath)
     except OSError as e:
@@ -1236,6 +1267,10 @@ def make_decrypt_output_path(fpath, password):
 def process_single(fpath, password, delete_original, encrypt_filename=False, progress_cb=None):
     mode = "decrypt" if fpath.lower().endswith(".enc") else "encrypt"
     try:
+        # Identität vor jeder Verarbeitung erfassen, damit beim optionalen
+        # Löschen kein inzwischen ausgetauschter Pfadeintrag entfernt wird.
+        source_identity = _file_identity(fpath) if delete_original else None
+
         if mode == "encrypt":
             out_path = make_encrypt_output_path(fpath, encrypt_filename)
             encrypt_file(fpath, out_path, password, progress_cb=progress_cb)
@@ -1245,7 +1280,7 @@ def process_single(fpath, password, delete_original, encrypt_filename=False, pro
 
         if delete_original:
             try:
-                delete_original_file(fpath)
+                delete_original_file(fpath, expected_identity=source_identity)
             except Exception:
                 return False, f"{os.path.basename(fpath)}: {mode} erfolgreich, Original konnte nicht entfernt werden."
 
@@ -2130,4 +2165,3 @@ def main(argv=None):
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     raise SystemExit(main())
-
