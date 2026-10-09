@@ -65,7 +65,10 @@ FORMAT_VERSION = 3
 MAGIC_V3 = b"AESCRYPT3"
 FORMAT_VERSION_V3 = 1
 
-APP_VERSION = "1.3.3"
+# Version 2 des AESCRYPT3-Headers: KDF-Parameter liegen im Header.
+FORMAT_VERSION_V3_KDF = 2
+
+APP_VERSION = "1.4.0"
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -78,16 +81,21 @@ MAX_NAME_LEN = 1024
 V3_CHUNK_SIZE_SIZE = 4
 V3_FILE_SIZE_SIZE = 8
 V3_CHUNK_COUNT_SIZE = 8
+V3_KDF_PARAM_SIZE = 4          # je Feld in v2: N, r, p als >I
 V3_RECORD_HEADER_SIZE = 8 + 4 + 4
 MAX_V3_CHUNK_SIZE = 64 * 1024 * 1024
 MAX_V3_CHUNK_COUNT = 0xFFFFFFFF
 
 # Scrypt ist speicherhart und erschwert Offline-Passwortangriffe.
+# Diese Werte dienen als Default für NEU geschriebene Dateien und als
+# Fallback für alte v1-Dateien, die keine Parameter im Header tragen.
 SCRYPT_N = 2**16
 SCRYPT_R = 8
 SCRYPT_P = 1
 
 # Harte Obergrenzen schützen vor versehentlich überhöhten Parametern.
+# Sie gelten sowohl für die Default-Konfiguration als auch für Werte,
+# die aus einer Datei gelesen werden (Schutz vor DoS über Header-Manipulation).
 # Die aktuellen Werte benötigen ungefähr 64 MiB Arbeitsspeicher.
 SCRYPT_MAX_N = 2**17
 SCRYPT_MAX_R = 16
@@ -99,7 +107,30 @@ SCRYPT_MAX_MEMORY_BYTES = 128 * 1024 * 1024
 # Kryptographie (Grundlagen)
 # ============================================================
 
-def derive_key(password: str, salt: bytes) -> bytes:
+def _validate_scrypt_params(n, r, p):
+    """Prüft Scrypt-Parameter gegen Typ, Form und Ressourcen-Obergrenzen.
+
+    Wird sowohl für die feste Konfiguration als auch für Werte verwendet,
+    die aus einem Datei-Header gelesen wurden. Die Ressourcenschätzung
+    verhindert, dass ein manipulierter Header exzessiven Speicher anfordert.
+    """
+    if (not isinstance(n, int) or n <= 1 or
+            n > SCRYPT_MAX_N or n & (n - 1)):
+        raise ValueError("Ungültige Scrypt-Konfiguration (N).")
+    if (not isinstance(r, int) or
+            not 1 <= r <= SCRYPT_MAX_R):
+        raise ValueError("Ungültige Scrypt-Konfiguration (r).")
+    if (not isinstance(p, int) or
+            not 1 <= p <= SCRYPT_MAX_P):
+        raise ValueError("Ungültige Scrypt-Konfiguration (p).")
+
+    # Konservative Speicherabschätzung; vor dem Start der teuren KDF prüfen.
+    estimated_memory = 128 * n * r + 256 * r * p + 256 * r
+    if estimated_memory > SCRYPT_MAX_MEMORY_BYTES:
+        raise ValueError("Scrypt-Konfiguration überschreitet das Speicherlimit.")
+
+
+def derive_key(password: str, salt: bytes, n=None, r=None, p=None) -> bytes:
     if not isinstance(password, str):
         raise TypeError("Passwort muss ein String sein.")
     if not password:
@@ -107,30 +138,24 @@ def derive_key(password: str, salt: bytes) -> bytes:
     if len(salt) != SALT_SIZE:
         raise ValueError("Ungültige Salt-Länge.")
 
-    # Diese Parameter stammen aktuell aus der festen Programmkonfiguration,
-    # nicht aus der Datei. Die Prüfung verhindert trotzdem unsichere oder
-    # versehentlich extrem ressourcenintensive Konfigurationswerte.
-    if (not isinstance(SCRYPT_N, int) or SCRYPT_N <= 1 or
-            SCRYPT_N > SCRYPT_MAX_N or SCRYPT_N & (SCRYPT_N - 1)):
-        raise ValueError("Ungültige Scrypt-Konfiguration (N).")
-    if (not isinstance(SCRYPT_R, int) or
-            not 1 <= SCRYPT_R <= SCRYPT_MAX_R):
-        raise ValueError("Ungültige Scrypt-Konfiguration (r).")
-    if (not isinstance(SCRYPT_P, int) or
-            not 1 <= SCRYPT_P <= SCRYPT_MAX_P):
-        raise ValueError("Ungültige Scrypt-Konfiguration (p).")
+    # Ohne explizite Parameter gelten die festen Programm-Defaults.
+    # Alte v1-Dateien rufen derive_key() ohne Parameter auf und erhalten
+    # dadurch exakt das bisherige Verhalten.
+    if n is None:
+        n = SCRYPT_N
+    if r is None:
+        r = SCRYPT_R
+    if p is None:
+        p = SCRYPT_P
 
-    # Konservative Speicherabschätzung; vor dem Start der teuren KDF prüfen.
-    estimated_memory = 128 * SCRYPT_N * SCRYPT_R + 256 * SCRYPT_R * SCRYPT_P + 256 * SCRYPT_R
-    if estimated_memory > SCRYPT_MAX_MEMORY_BYTES:
-        raise ValueError("Scrypt-Konfiguration überschreitet das Speicherlimit.")
+    _validate_scrypt_params(n, r, p)
 
     kdf = Scrypt(
         salt=salt,
         length=32,
-        n=SCRYPT_N,
-        r=SCRYPT_R,
-        p=SCRYPT_P,
+        n=n,
+        r=r,
+        p=p,
     )
     return kdf.derive(password.encode("utf-8"))
 
@@ -172,9 +197,16 @@ def read_header(fin):
     return salt, nonce, header
 
 
-def build_v3_header(salt: bytes, base_nonce: bytes, file_size: int, data_chunk_count: int) -> bytes:
-    """AESCRYPT3 Header. Enthält Größe und erwartete Chunk-Anzahl,
-    damit Trunkierung/Entfernung von Chunks erkannt wird."""
+def build_v3_header(salt: bytes, base_nonce: bytes, file_size: int,
+                    data_chunk_count: int, n=None, r=None, p=None) -> bytes:
+    """AESCRYPT3-Hader der aktuellen Version (v2).
+
+    Enthält Größe, erwartete Chunk-Anzahl und die verwendeten
+    Scrypt-Parameter, damit Trunkierung/Entfernung von Chunks erkannt wird
+    und die Schlüsselableitung nicht mehr an feste Programmkonstanten
+    gebunden ist. Die Parameter sind in den AAD eingebunden und damit
+    nicht unbemerkt manipulierbar.
+    """
     if len(salt) != SALT_SIZE:
         raise ValueError("Ungültige Salt-Länge.")
     if len(base_nonce) != NONCE_SIZE:
@@ -184,24 +216,48 @@ def build_v3_header(salt: bytes, base_nonce: bytes, file_size: int, data_chunk_c
     if not 0 <= data_chunk_count <= MAX_V3_CHUNK_COUNT:
         raise ValueError("Zu viele Chunks.")
 
+    if n is None:
+        n = SCRYPT_N
+    if r is None:
+        r = SCRYPT_R
+    if p is None:
+        p = SCRYPT_P
+
+    _validate_scrypt_params(n, r, p)
+
     return (
         MAGIC_V3
-        + bytes([FORMAT_VERSION_V3])
+        + bytes([FORMAT_VERSION_V3_KDF])
         + salt
         + base_nonce
         + struct.pack(">I", CHUNK_SIZE)
         + struct.pack(">Q", file_size)
         + struct.pack(">Q", data_chunk_count)
+        + struct.pack(">I", n)
+        + struct.pack(">I", r)
+        + struct.pack(">I", p)
     )
 
 
 def read_v3_header(fin):
+    """Liest den AESCRYPT3-Header und liefert auch die Scrypt-Parameter.
+
+    Unterstützt sowohl v1-Dateien (ohne Parameter im Header; feste
+    Programm-Defaults) als auch v2-Dateien (Parameter im Header).
+    Rückgabe:
+        salt, base_nonce, chunk_size, file_size, data_chunk_count,
+        scrypt_params, header
+    wobei scrypt_params ein Dict mit den Schlüsseln "n", "r", "p" ist.
+    """
     magic = fin.read(len(MAGIC_V3))
     if magic != MAGIC_V3:
         raise ValueError("Ungültiges oder nicht unterstütztes AESCRYPT3-Format.")
 
     version = fin.read(1)
-    if len(version) != 1 or version[0] != FORMAT_VERSION_V3:
+    if len(version) != 1:
+        raise ValueError("AESCRYPT3-Header unvollständig.")
+    version_number = version[0]
+    if version_number not in (FORMAT_VERSION_V3, FORMAT_VERSION_V3_KDF):
         raise ValueError("Nicht unterstützte AESCRYPT3-Version.")
 
     salt = fin.read(SALT_SIZE)
@@ -239,7 +295,30 @@ def read_v3_header(fin):
         + chunk_count_raw
     )
 
-    return salt, base_nonce, chunk_size, file_size, data_chunk_count, header
+    if version_number == FORMAT_VERSION_V3_KDF:
+        kdf_raw = fin.read(3 * V3_KDF_PARAM_SIZE)
+        if len(kdf_raw) != 3 * V3_KDF_PARAM_SIZE:
+            raise ValueError("AESCRYPT3-Header unvollständig (KDF-Parameter).")
+        n, r, p = struct.unpack(">III", kdf_raw)
+        # Werte stammen aus einer Datei und sind nicht vertrauenswürdig.
+        _validate_scrypt_params(n, r, p)
+        header = header + kdf_raw
+        scrypt_params = {"n": n, "r": r, "p": p}
+    else:
+        # v1: Parameter waren nicht im Header; es galten die damaligen
+        # festen Programmkonstanten. Für Abwärtskompatibilität die
+        # aktuellen Defaults verwenden.
+        scrypt_params = {"n": SCRYPT_N, "r": SCRYPT_R, "p": SCRYPT_P}
+
+    return (
+        salt,
+        base_nonce,
+        chunk_size,
+        file_size,
+        data_chunk_count,
+        scrypt_params,
+        header,
+    )
 
 
 def build_v3_nonce(base_nonce: bytes, chunk_index: int) -> bytes:
@@ -484,21 +563,21 @@ def install_temp_no_overwrite(tmp_path, output_path):
 def encrypt_text(text: str, password: str) -> str:
     if not isinstance(text, str):
         raise TypeError("Text muss ein String sein.")
-    
+
     salt = secrets.token_bytes(SALT_SIZE)
     nonce = secrets.token_bytes(NONCE_SIZE)
     aes_key = derive_key(password, salt)
-    
+
     header = build_header(salt, nonce)
     plaintext_bytes = text.encode("utf-8")
-    
+
     cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce))
     encryptor = cipher.encryptor()
     encryptor.authenticate_additional_data(header)
-    
+
     ciphertext = encryptor.update(plaintext_bytes) + encryptor.finalize()
     tag = encryptor.tag
-    
+
     payload = header + ciphertext + tag
     return base64.b64encode(payload).decode("utf-8")
 
@@ -508,10 +587,10 @@ def decrypt_text(encoded_payload: str, password: str) -> str:
         payload = base64.b64decode(encoded_payload.encode("utf-8"), validate=True)
     except Exception:
         raise ValueError("Ungültiges Base64-Format.")
-    
+
     header_size = len(MAGIC) + 1 + SALT_SIZE + NONCE_SIZE
     minimum_size = header_size + TAG_SIZE
-    
+
     if len(payload) < minimum_size:
         raise ValueError("Daten zu kurz oder beschädigt.")
 
@@ -520,25 +599,25 @@ def decrypt_text(encoded_payload: str, password: str) -> str:
         raise ValueError("Ungültiges oder nicht unterstütztes Dateiformat.")
     if payload[len(MAGIC)] != FORMAT_VERSION:
         raise ValueError("Nicht unterstützte Dateiformat-Version.")
-        
+
     header = payload[:header_size]
     salt = header[len(MAGIC) + 1 : len(MAGIC) + 1 + SALT_SIZE]
     nonce = header[len(MAGIC) + 1 + SALT_SIZE :]
-    
+
     tag = payload[-TAG_SIZE:]
     ciphertext = payload[header_size:-TAG_SIZE]
-    
+
     aes_key = derive_key(password, salt)
-    
+
     cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
     decryptor = cipher.decryptor()
     decryptor.authenticate_additional_data(header)
-    
+
     try:
         plaintext_bytes = decryptor.update(ciphertext) + decryptor.finalize()
     except InvalidTag:
         raise ValueError("Falsches Passwort oder beschädigte Daten.")
-        
+
     return plaintext_bytes.decode("utf-8")
 
 
@@ -702,7 +781,15 @@ def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
     tmp_path = None
 
     with open(input_path, "rb") as fin:
-        salt, base_nonce, chunk_size, file_size, data_chunk_count, header = read_v3_header(fin)
+        (
+            salt,
+            base_nonce,
+            chunk_size,
+            file_size,
+            data_chunk_count,
+            scrypt_params,
+            header,
+        ) = read_v3_header(fin)
 
         if chunk_size != CHUNK_SIZE:
             if chunk_size <= 0 or chunk_size > MAX_V3_CHUNK_SIZE:
@@ -712,7 +799,13 @@ def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
         if fsize < minimum_size:
             raise ValueError("AESCRYPT3-Datei zu klein oder beschädigt.")
 
-        aes_key = derive_key(password, salt)
+        aes_key = derive_key(
+            password,
+            salt,
+            n=scrypt_params["n"],
+            r=scrypt_params["r"],
+            p=scrypt_params["p"],
+        )
 
         out_dir = os.path.dirname(output_path) or "."
         os.makedirs(out_dir, exist_ok=True)
@@ -956,8 +1049,22 @@ def get_original_filename(enc_path, password):
 
     if magic == MAGIC_V3:
         with open(enc_path, "rb") as fin:
-            salt, base_nonce, chunk_size, file_size, data_chunk_count, header = read_v3_header(fin)
-            aes_key = derive_key(password, salt)
+            (
+                salt,
+                base_nonce,
+                chunk_size,
+                file_size,
+                data_chunk_count,
+                scrypt_params,
+                header,
+            ) = read_v3_header(fin)
+            aes_key = derive_key(
+                password,
+                salt,
+                n=scrypt_params["n"],
+                r=scrypt_params["r"],
+                p=scrypt_params["p"],
+            )
             record = read_v3_chunk(
                 fin, max_chunk_size=NAME_LEN_SIZE + MAX_NAME_LEN
             )
@@ -1152,7 +1259,7 @@ def process_single(fpath, password, delete_original, encrypt_filename=False, pro
     except Exception as exc:
         # Auch unerwartete Datei-/Krypto-Fehler dürfen den Worker nicht vorzeitig
         # beenden, sonst wird _processing_finished() nicht aufgerufen und die GUI
-        # bleibt im Zustand „Wird vorbereitet“ bzw. der Button bleibt gesperrt.
+        # bleibt im Zustand „Wird vorbereitet" bzw. der Button bleibt gesperrt.
         detail = str(exc).strip() or exc.__class__.__name__
         return False, f"{os.path.basename(fpath)}: {detail}"
 
@@ -1377,7 +1484,7 @@ if GUI_AVAILABLE:
             # Notebook (Tabs) erstellen
             self.notebook = ttk.Notebook(self.root)
             self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
-            
+
             # Reiter 1: Datei-Verschlüsselung mit Drag-and-Drop
             self.tab_files = ttk.Frame(self.notebook)
             self.notebook.add(self.tab_files, text="Dateien / Ordner")
@@ -1564,9 +1671,9 @@ if GUI_AVAILABLE:
             # Passwort anzeigen Checkbutton (Dateien-Tab)
             self.file_show_pwd_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
-                opt_frame, 
-                text="Anzeigen", 
-                variable=self.file_show_pwd_var, 
+                opt_frame,
+                text="Anzeigen",
+                variable=self.file_show_pwd_var,
                 command=self.toggle_file_password_visibility
             ).pack(side="left", padx=5)
 
@@ -1648,7 +1755,7 @@ if GUI_AVAILABLE:
             for f in files:
                 if f not in self.file_listbox.get(0, tk.END):
                     self.file_listbox.insert(tk.END, f)
-        
+
         def add_folder(self):
             folder = filedialog.askdirectory(title="Ordner auswählen")
             if folder:
@@ -1820,44 +1927,44 @@ if GUI_AVAILABLE:
         def setup_text_tab(self):
             pwd_frame = ttk.LabelFrame(self.tab_text, text="Passwort", padding=10)
             pwd_frame.pack(fill="x", padx=10, pady=10)
-            
+
             ttk.Label(pwd_frame, text="Passwort:").pack(side="left", padx=5)
             self.text_pwd_entry = ttk.Entry(pwd_frame, show="*", width=25)
             self.text_pwd_entry.pack(side="left", padx=5, fill="x", expand=True)
-            
+
             # Passwort anzeigen Checkbutton (Text-Tab)
             self.text_show_pwd_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
-                pwd_frame, 
-                text="Anzeigen", 
-                variable=self.text_show_pwd_var, 
+                pwd_frame,
+                text="Anzeigen",
+                variable=self.text_show_pwd_var,
                 command=self.toggle_text_password_visibility
             ).pack(side="left", padx=5)
 
             io_frame = ttk.Frame(self.tab_text)
             io_frame.pack(fill="both", expand=True, padx=10, pady=5)
-            
+
             left_pane = ttk.Frame(io_frame)
             left_pane.pack(side="left", fill="both", expand=True, padx=5)
             ttk.Label(left_pane, text="Eingabetext (Klartext oder Ciphertext):").pack(anchor="w")
             self.input_text_area = scrolledtext.ScrolledText(left_pane, height=10, width=30)
             self.input_text_area.pack(fill="both", expand=True, pady=5)
-            
+
             btn_pane = ttk.Frame(io_frame)
             btn_pane.pack(side="left", fill="y", padx=5, pady=20)
-            
+
             ttk.Button(btn_pane, text="Ver-/Entschlüsseln", command=self.on_process_text).pack(fill="x", pady=5)
-            
+
             right_pane = ttk.Frame(io_frame)
             right_pane.pack(side="left", fill="both", expand=True, padx=5)
             ttk.Label(right_pane, text="Ergebnis:").pack(anchor="w")
             self.output_text_area = scrolledtext.ScrolledText(right_pane, height=10, width=30)
             self.output_text_area.pack(fill="both", expand=True, pady=5)
-            
+
             # Untere Steuerungsleiste (Kopieren & Felder leeren)
             action_frame = ttk.Frame(self.tab_text)
             action_frame.pack(fill="x", padx=10, pady=10)
-            
+
             ttk.Button(action_frame, text="Ergebnis in Zwischenablage kopieren", command=self.copy_to_clipboard).pack(side="left", fill="x", expand=True, padx=(0, 5))
             ttk.Button(action_frame, text="Felder leeren", command=self.clear_text_fields).pack(side="right", padx=(5, 0))
 
@@ -2023,3 +2130,4 @@ def main(argv=None):
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     raise SystemExit(main())
+
