@@ -143,5 +143,3 @@ Konstanten-Referenz
 | SCRYPTMAXR | 16 |
 | SCRYPTMAXP | 4 |
 | SCRYPTMAXMEMORY_BYTES | 134 217 728 (128 MiB) |
-
-Eine Randnotiz zur Verifikation: Die Tabellen sind aus dem Quellcode abgeleitet, den du gepostet hast — die Byte-Zahlen habe ich addiert (z.B. 9+1+16+12+4+8+8+4+4+4 = 70 für den v2-Header), nicht gemessen. Wenn du einen Byte-Level-Beweis willst, liest du den Header einer erzeugten .enc mit hexdump -C und vergleichst die ersten 70 Bytes gegen Tabelle 1 — das bestätigt Magic, Version, Chunk-Größe und die KDF-Parameter in einem Blick.
