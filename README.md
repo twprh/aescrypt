@@ -1,6 +1,6 @@
 <img width="926" height="682" alt="grafik" src="https://github.com/user-attachments/assets/49eaab4a-d9a6-48ed-885d-3a1bd295174c" />
 
-Dateiaufbau AES Crypto Tool v1.4.0
+### Dateiaufbau AES Crypto Tool v1.4.0
 
 Alle Größen in Bytes. > = Big-Endian. Der Magic-String ist die Primärdiskriminante: decryptfile() liest die ersten 9 Bytes und verzweigt danach.
 
