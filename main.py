@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import hashlib
 import sys
 import secrets
 import struct
@@ -545,76 +546,124 @@ def decrypt_text(encoded_payload: str, password: str) -> str:
 # Datei-Verschlüsselung & Entschlüsselung
 # ============================================================
 
+def _sha256_file(path):
+    """Berechnet SHA-256 blockweise, ohne die Datei vollständig in den RAM zu laden."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            block = stream.read(CHUNK_SIZE)
+            if not block:
+                break
+            digest.update(block)
+    return digest.digest()
+
+
+def _copy_source_snapshot(input_path, snapshot_fd):
+    """Kopiert die Quelle in den exklusiv angelegten Snapshot-Dateideskriptor."""
+    digest = hashlib.sha256()
+    with open(input_path, "rb") as source, os.fdopen(snapshot_fd, "wb") as snapshot:
+        while True:
+            block = source.read(CHUNK_SIZE)
+            if not block:
+                break
+            snapshot.write(block)
+            digest.update(block)
+        snapshot.flush()
+        os.fsync(snapshot.fileno())
+    return digest.digest()
+
+
 def encrypt_file(input_path, output_path, password, progress_cb=None):
-    """Neue Dateien werden ausschließlich als AESCRYPT3 geschrieben."""
+    """Verschlüsselt eine stabile Momentaufnahme als AESCRYPT3.
+
+    Die Quelle wird vor der Verschlüsselung in eine temporäre Snapshot-Datei
+    kopiert. SHA-256-Prüfungen vor und nach der Verschlüsselung erkennen
+    Änderungen der Quelldatei während des Vorgangs. Das Verfahren verwendet
+    ausschließlich portable Python-Dateioperationen für Windows und Linux.
+    """
     input_path = os.path.abspath(input_path)
     output_path = os.path.abspath(output_path)
 
-    if input_path == output_path:
+    if os.path.normcase(input_path) == os.path.normcase(output_path):
         raise ValueError("Quelle und Ziel dürfen nicht identisch sein.")
-
-    file_size = os.path.getsize(input_path)
-    data_chunk_count = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE if file_size else 0
-
-    salt = secrets.token_bytes(SALT_SIZE)
-    base_nonce = secrets.token_bytes(NONCE_SIZE)
-    aes_key = derive_key(password, salt)
-
-    orig_name = os.path.basename(input_path).encode("utf-8")
-    if len(orig_name) == 0 or len(orig_name) > MAX_NAME_LEN:
-        raise ValueError("Dateiname zu lang oder leer.")
-
-    metadata = struct.pack(">I", len(orig_name)) + orig_name
-    header = build_v3_header(salt, base_nonce, file_size, data_chunk_count)
 
     out_dir = os.path.dirname(output_path) or "."
     os.makedirs(out_dir, exist_ok=True)
 
-    tmp_fd, tmp_path = tempfile.mkstemp(
-        dir=out_dir, prefix=".aescrypto-", suffix=".tmp"
+    snapshot_fd, snapshot_path = tempfile.mkstemp(
+        dir=out_dir, prefix=".aescrypto-snapshot-", suffix=".tmp"
     )
+    tmp_fd = None
+    tmp_path = None
 
     try:
-        # Quelle separat öffnen, damit bei einem Fehler hier der bereits durch
-        # mkstemp() angelegte Dateideskriptor sicher geschlossen werden kann.
-        with open(input_path, "rb") as fin:
+        # Erst eine private Momentaufnahme erzeugen. Änderungen der Quelle
+        # während des Kopierens werden durch den anschließenden Hashvergleich
+        # erkannt, sofern sie nicht exakt auf denselben Dateiinhalt zurücklaufen.
+        snapshot_fd_for_copy = snapshot_fd
+        snapshot_fd = None  # _copy_source_snapshot schließt den Deskriptor auch bei Fehlern.
+        snapshot_digest = _copy_source_snapshot(input_path, snapshot_fd_for_copy)
+        file_size = os.path.getsize(snapshot_path)
+        if _sha256_file(input_path) != snapshot_digest:
+            raise ValueError(
+                "Quelldatei wurde während der Momentaufnahme verändert; "
+                "Verschlüsselung abgebrochen."
+            )
+
+        data_chunk_count = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE if file_size else 0
+        if data_chunk_count > MAX_V3_CHUNK_COUNT:
+            raise ValueError("Quelldatei ist für das AESCRYPT3-Format zu groß.")
+
+        salt = secrets.token_bytes(SALT_SIZE)
+        base_nonce = secrets.token_bytes(NONCE_SIZE)
+        aes_key = derive_key(password, salt)
+
+        # Den ursprünglichen Namen in den verschlüsselten Metadaten behalten,
+        # obwohl die Nutzdaten aus der temporären Momentaufnahme gelesen werden.
+        orig_name = os.path.basename(input_path).encode("utf-8")
+        if len(orig_name) == 0 or len(orig_name) > MAX_NAME_LEN:
+            raise ValueError("Dateiname zu lang oder leer.")
+
+        metadata = struct.pack(">I", len(orig_name)) + orig_name
+        header = build_v3_header(salt, base_nonce, file_size, data_chunk_count)
+
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=out_dir, prefix=".aescrypto-", suffix=".tmp"
+        )
+
+        with open(snapshot_path, "rb") as fin:
             with os.fdopen(tmp_fd, "wb") as fout:
                 tmp_fd = None
                 fout.write(header)
-
-                # Chunk 0 enthält ausschließlich die verschlüsselten Dateimetadaten.
-                write_v3_chunk(
-                    fout, aes_key, base_nonce, header, 0, metadata
-                )
+                write_v3_chunk(fout, aes_key, base_nonce, header, 0, metadata)
 
                 bytes_read = 0
                 for index in range(1, data_chunk_count + 1):
                     expected = min(CHUNK_SIZE, file_size - bytes_read)
                     chunk = fin.read(expected)
                     if len(chunk) != expected:
-                        raise ValueError("Quelldatei konnte während der Verschlüsselung nicht vollständig gelesen werden.")
-
-                    write_v3_chunk(
-                        fout, aes_key, base_nonce, header, index, chunk
-                    )
-
+                        raise ValueError("Interne Momentaufnahme ist unvollständig.")
+                    write_v3_chunk(fout, aes_key, base_nonce, header, index, chunk)
                     bytes_read += len(chunk)
                     if progress_cb:
                         should_stop = progress_cb(bytes_read, file_size)
                         if should_stop is False:
                             raise InterruptedError("Verarbeitung vom Benutzer gestoppt.")
 
-                if bytes_read != file_size:
-                    raise ValueError("Dateigröße hat sich während der Verschlüsselung geändert.")
-
-                # Auch eine während der Verschlüsselung gewachsene Quelldatei
-                # erkennen; andernfalls würden zusätzliche Bytes stillschweigend
-                # nicht in die verschlüsselte Ausgabe übernommen.
-                if fin.read(1):
-                    raise ValueError("Quelldatei ist während der Verschlüsselung gewachsen.")
+                if bytes_read != file_size or fin.read(1):
+                    raise ValueError("Interne Momentaufnahme hat eine unerwartete Größe.")
 
                 fout.flush()
                 os.fsync(fout.fileno())
+
+        # Prüft auch Änderungen, die während der eigentlichen Verschlüsselung
+        # an der Originalquelle vorgenommen wurden. Vor erfolgreicher Prüfung
+        # wird die Ausgabedatei nicht unter ihrem endgültigen Namen veröffentlicht.
+        if _sha256_file(input_path) != snapshot_digest:
+            raise ValueError(
+                "Quelldatei wurde während der Verschlüsselung verändert; "
+                "Ausgabe wird verworfen."
+            )
 
         install_temp_no_overwrite(tmp_path, output_path)
         tmp_path = None
@@ -631,7 +680,16 @@ def encrypt_file(input_path, output_path, password, progress_cb=None):
             except OSError:
                 pass
         raise
-
+    finally:
+        if snapshot_fd is not None:
+            try:
+                os.close(snapshot_fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(snapshot_path)
+        except OSError:
+            pass
 
 def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
     input_path = os.path.abspath(input_path)
