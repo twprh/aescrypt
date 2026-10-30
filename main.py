@@ -68,7 +68,7 @@ FORMAT_VERSION_V3 = 1
 # Version 2 des AESCRYPT3-Headers: KDF-Parameter liegen im Header.
 FORMAT_VERSION_V3_KDF = 2
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -1484,6 +1484,8 @@ if GUI_AVAILABLE:
             self.root = root
             self.root.title(f"AES Crypto Tool v{APP_VERSION}")
             self.root.geometry("700x580")
+            # GUI-Fenster unter Windows und Linux dauerhaft im Vordergrund halten.
+            self.root.attributes("-topmost", True)
 
             # Tray-Status
             self.tray_icon = None
@@ -1611,11 +1613,8 @@ if GUI_AVAILABLE:
             try:
                 self.root.deiconify()
                 self.root.lift()
+                # Den Vordergrund-Status auch nach dem Wiederherstellen beibehalten.
                 self.root.attributes("-topmost", True)
-                self.root.after(
-                    100,
-                    lambda: self.root.attributes("-topmost", False)
-                )
                 self.root.focus_force()
             except Exception:
                 pass
