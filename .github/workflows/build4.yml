@@ -12,8 +12,13 @@ on:
 permissions:
   contents: write
 
-jobs:
+env:
+  APP_SCRIPT: AES_Crypto_Tool.py
+  APP_NAME: aescrypto
+  PYTHON_VERSION: "3.12.3"
+  PYINSTALLER_VERSION: "6.22.3"
 
+jobs:
   # ============================================================
   # Linux Build
   # ============================================================
@@ -28,50 +33,53 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.12.3"
-          cache: "pip"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller==6.22.3
-
-      - name: Verify icon
+      - name: Verify source script
         shell: bash
         run: |
-          if [[ ! -f "aescrypto.ico" ]]; then
-            echo "ERROR: aescrypto.ico wurde im Repository-Root nicht gefunden."
+          if [[ ! -f "$APP_SCRIPT" ]]; then
+            echo "ERROR: $APP_SCRIPT wurde im Repository-Root nicht gefunden."
             exit 1
           fi
+          python -m py_compile "$APP_SCRIPT"
+          ls -lh "$APP_SCRIPT"
 
-          echo "Icon gefunden:"
-          ls -lh aescrypto.ico
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "cryptography>=41.0" \
+            "PySide6>=6.6" \
+            "Pillow>=10.0" \
+            "pyinstaller==$PYINSTALLER_VERSION"
 
       - name: Build with PyInstaller
+        shell: bash
         run: |
           pyinstaller \
             --clean \
             --noconfirm \
             --onefile \
             --windowed \
-            --icon="$PWD/aescrypto.ico" \
-            --collect-all tkinterdnd2 \
-            --hidden-import=pystray.win32 \
-            --name aescrypto \
-            main.py
+            --collect-all PySide6 \
+            --collect-all shiboken6 \
+            --collect-all cryptography \
+            --name "$APP_NAME" \
+            "$APP_SCRIPT"
 
       - name: Verify Linux executable
         shell: bash
         run: |
-          if [[ ! -f "dist/aescrypto" ]]; then
+          if [[ ! -f "dist/$APP_NAME" ]]; then
             echo "ERROR: Linux executable wurde nicht erzeugt."
             exit 1
           fi
-
-          echo "Linux executable:"
-          ls -lh dist/aescrypto
-          du -h dist/aescrypto
+          chmod +x "dist/$APP_NAME"
+          ls -lh "dist/$APP_NAME"
+          file "dist/$APP_NAME"
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v7
@@ -79,7 +87,7 @@ jobs:
           name: aescrypto-linux
           path: dist/aescrypto
           if-no-files-found: error
-
+          retention-days: 14
 
   # ============================================================
   # Windows Build
@@ -95,40 +103,32 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.12.3"
-          cache: "pip"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Install dependencies
+      - name: Verify source script and icon
+        shell: pwsh
+        run: |
+          if (-not (Test-Path $env:APP_SCRIPT)) {
+            throw "ERROR: $env:APP_SCRIPT wurde im Repository-Root nicht gefunden."
+          }
+          if (-not (Test-Path "aescrypto.ico")) {
+            throw "ERROR: aescrypto.ico wurde im Repository-Root nicht gefunden."
+          }
+          python -m py_compile $env:APP_SCRIPT
+          Get-Item $env:APP_SCRIPT, "aescrypto.ico" | Select-Object Name, Length
+
+      - name: Install build dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller==6.22.3
+          python -m pip install `
+            "cryptography>=41.0" `
+            "PySide6>=6.6" `
+            "Pillow>=10.0" `
+            "pyinstaller==$env:PYINSTALLER_VERSION"
 
-      # ----------------------------------------------------------
-      # Prüfen, ob das Icon wirklich im Repository-Root liegt
-      # ----------------------------------------------------------
-      - name: Verify icon
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "aescrypto.ico")) {
-            Write-Error "ERROR: aescrypto.ico wurde im Repository-Root nicht gefunden."
-            exit 1
-          }
-
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "Icon gefunden"
-          Write-Host "========================================"
-
-          Get-Item "aescrypto.ico" |
-            Select-Object FullName, Length
-
-          Write-Host ""
-
-      # ----------------------------------------------------------
-      # PyInstaller Build
-      # ----------------------------------------------------------
       - name: Build with PyInstaller
         shell: pwsh
         run: |
@@ -140,42 +140,28 @@ jobs:
             --windowed `
             --icon="$PWD\aescrypto.ico" `
             --add-data "aescrypto.ico;." `
-            --collect-submodules tkinterdnd2 `
-            --hidden-import=pystray._win32 `
-            --name aescrypto `
-            main.py
+            --collect-all PySide6 `
+            --collect-all shiboken6 `
+            --collect-all cryptography `
+            --name "$env:APP_NAME" `
+            "$env:APP_SCRIPT"
 
-      # ----------------------------------------------------------
-      # Prüfen, ob die EXE erzeugt wurde
-      # ----------------------------------------------------------
       - name: Verify Windows executable
         shell: pwsh
         run: |
-          if (-not (Test-Path "dist\aescrypto.exe")) {
-            Write-Error "ERROR: aescrypto.exe wurde nicht erzeugt."
-            exit 1
+          $exe = "dist\$env:APP_NAME.exe"
+          if (-not (Test-Path $exe)) {
+            throw "ERROR: $exe wurde nicht erzeugt."
           }
+          Get-Item $exe | Select-Object Name, Length, FullName
 
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "Windows executable erfolgreich erzeugt"
-          Write-Host "========================================"
-
-          Get-Item "dist\aescrypto.exe" |
-            Select-Object Name, Length, FullName
-
-          Write-Host ""
-
-      # ----------------------------------------------------------
-      # Artifact hochladen
-      # ----------------------------------------------------------
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
           name: aescrypto-windows
           path: dist/aescrypto.exe
           if-no-files-found: error
-
+          retention-days: 14
 
   # ============================================================
   # GitHub Release
@@ -183,46 +169,28 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-
     needs:
       - build-linux
       - build-windows
-
-    # Release nur erstellen, wenn release_version angegeben wurde.
-    # Der Build selbst muss nicht zwingend auf beiden Plattformen
-    # erfolgreich sein.
-    if: |
-      always() &&
-      inputs.release_version != ''
+    if: always() && inputs.release_version != ''
 
     steps:
-
-      # ----------------------------------------------------------
-      # Repository auschecken
-      # ----------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      # ----------------------------------------------------------
-      # Build-Ergebnisse prüfen
-      # ----------------------------------------------------------
       - name: Check build results
         shell: bash
+        env:
+          LINUX_RESULT: ${{ needs.build-linux.result }}
+          WINDOWS_RESULT: ${{ needs.build-windows.result }}
         run: |
-          echo "Linux build:   ${{ needs.build-linux.result }}"
-          echo "Windows build: ${{ needs.build-windows.result }}"
-
-          if [[ "${{ needs.build-linux.result }}" != "success" ]] && \
-             [[ "${{ needs.build-windows.result }}" != "success" ]]; then
-            echo ""
-            echo "ERROR: Beide Builds sind fehlgeschlagen."
-            echo "Es wird kein Release erstellt."
+          echo "Linux build:   $LINUX_RESULT"
+          echo "Windows build: $WINDOWS_RESULT"
+          if [[ "$LINUX_RESULT" != "success" && "$WINDOWS_RESULT" != "success" ]]; then
+            echo "ERROR: Beide Builds sind fehlgeschlagen. Es wird kein Release erstellt."
             exit 1
           fi
 
-      # ----------------------------------------------------------
-      # Linux Artifact herunterladen
-      # ----------------------------------------------------------
       - name: Download Linux artifact
         if: needs.build-linux.result == 'success'
         uses: actions/download-artifact@v8
@@ -230,9 +198,6 @@ jobs:
           name: aescrypto-linux
           path: release
 
-      # ----------------------------------------------------------
-      # Windows Artifact herunterladen
-      # ----------------------------------------------------------
       - name: Download Windows artifact
         if: needs.build-windows.result == 'success'
         uses: actions/download-artifact@v8
@@ -240,86 +205,38 @@ jobs:
           name: aescrypto-windows
           path: release
 
-      # ----------------------------------------------------------
-      # GitHub Release erstellen / aktualisieren
-      # ----------------------------------------------------------
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-
+          RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
-          set -e
+          set -euo pipefail
+          TAG="$RELEASE_VERSION"
 
-          TAG="${{ inputs.release_version }}"
-
-          echo "Release version: $TAG"
-
-          # ------------------------------------------------------
-          # Version prüfen
-          # ------------------------------------------------------
-          if [[ "$TAG" != v* && "$TAG" != V* ]]; then
-            echo ""
-            echo "ERROR: Release version must start with 'v'."
-            echo "Example: v1.0.0"
+          if [[ ! "$TAG" =~ ^[vV][0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: Ungültige Release-Version: $TAG (Beispiel: v1.0.0)"
             exit 1
           fi
 
-          # ------------------------------------------------------
-          # Vorhandene Build-Dateien sammeln
-          # ------------------------------------------------------
           FILES=()
+          [[ -f release/aescrypto ]] && FILES+=("release/aescrypto")
+          [[ -f release/aescrypto.exe ]] && FILES+=("release/aescrypto.exe")
 
-          if [[ -f "release/aescrypto" ]]; then
-            FILES+=("release/aescrypto")
-          fi
-
-          if [[ -f "release/aescrypto.exe" ]]; then
-            FILES+=("release/aescrypto.exe")
-          fi
-
-          # ------------------------------------------------------
-          # Prüfen, ob mindestens ein Build vorhanden ist
-          # ------------------------------------------------------
           if [[ ${#FILES[@]} -eq 0 ]]; then
-            echo ""
-            echo "ERROR: No build artifacts found."
+            echo "ERROR: Keine Build-Artefakte gefunden."
             exit 1
           fi
 
-          echo ""
-          echo "Files for release:"
+          echo "Release-Dateien:"
           printf '%s\n' "${FILES[@]}"
 
-          # ------------------------------------------------------
-          # Release existiert bereits?
-          # ------------------------------------------------------
           if gh release view "$TAG" >/dev/null 2>&1; then
-
-            echo ""
-            echo "Release $TAG already exists."
-            echo "Uploading new build artifacts..."
-
-            gh release upload \
-              "$TAG" \
-              "${FILES[@]}" \
-              --clobber
-
+            gh release upload "$TAG" "${FILES[@]}" --clobber
           else
-
-            echo ""
-            echo "Creating new GitHub Release $TAG..."
-
-            gh release create \
-              "$TAG" \
-              "${FILES[@]}" \
+            gh release create "$TAG" "${FILES[@]}" \
               --title "$TAG" \
               --generate-notes
-
           fi
 
-          echo ""
-          echo "========================================"
-          echo "Release successfully created/updated"
-          echo "Version: $TAG"
-          echo "========================================"
+          echo "Release $TAG erfolgreich erstellt/aktualisiert."
