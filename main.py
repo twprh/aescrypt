@@ -1669,8 +1669,8 @@ if GUI_AVAILABLE:
 
             ttk.Button(btn_frame, text="Dateien hinzufügen", command=self.add_files).pack(side="left", padx=5)
             ttk.Button(btn_frame, text="Ordner hinzufügen", command=self.add_folder).pack(side="left", padx=5)
-            ttk.Button(btn_frame, text="Ausgewählte entfernen", command=self.remove_selected_files).pack(side="left", padx=5)
             ttk.Button(btn_frame, text="Liste leeren", command=self.clear_list).pack(side="left", padx=5)
+            ttk.Button(btn_frame, text="Ausgewählte entfernen", command=self.remove_selected_files).pack(side="left", padx=5)
 
             # Listbox für Dateipfade
             # Kompakt halten, damit Einstellungen, Fortschritt und
@@ -1680,17 +1680,15 @@ if GUI_AVAILABLE:
             list_frame.pack(fill="x", expand=False)
             list_frame.pack_propagate(False)
 
-            # Tkinter-Standardauswahl verwenden: EXTENDED unterstützt unter
-            # Windows und Linux Einzelklick, Strg+Klick und Umschalt+Klick nativ.
-            # exportselection=False erhält die Markierung auch bei Fokuswechseln.
             self.file_listbox = tk.Listbox(
                 list_frame,
                 selectmode=tk.EXTENDED,
                 exportselection=False,
+                selectbackground="#2563EB",
+                selectforeground="#FFFFFF",
+                activestyle="none",
             )
             self.file_listbox.pack(side="left", fill="both", expand=True)
-            # Markierte Einträge lassen sich zusätzlich über die Entf-Taste entfernen.
-            self.file_listbox.bind("<Delete>", self.remove_selected_files)
 
             scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.file_listbox.yview)
             scrollbar.pack(side="right", fill="y")
@@ -1808,15 +1806,15 @@ if GUI_AVAILABLE:
                     if f not in self.file_listbox.get(0, tk.END):
                         self.file_listbox.insert(tk.END, f)
 
+        def clear_list(self):
+            self.file_listbox.delete(0, tk.END)
+
         def remove_selected_files(self, event=None):
-            """Entfernt markierte Listeneinträge, nicht die Dateien auf dem Datenträger."""
+            """Entfernt nur die markierten Einträge aus der GUI-Dateiliste."""
             selected_indices = self.file_listbox.curselection()
             for index in reversed(selected_indices):
                 self.file_listbox.delete(index)
             return "break"
-
-        def clear_list(self):
-            self.file_listbox.delete(0, tk.END)
 
         def start_processing(self):
             # Derselbe Button dient während eines laufenden Jobs zum Stoppen.
