@@ -68,7 +68,7 @@ FORMAT_VERSION_V3 = 1
 # Version 2 des AESCRYPT3-Headers: KDF-Parameter liegen im Header.
 FORMAT_VERSION_V3_KDF = 2
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
