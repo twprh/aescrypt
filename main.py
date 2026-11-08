@@ -1669,6 +1669,7 @@ if GUI_AVAILABLE:
 
             ttk.Button(btn_frame, text="Dateien hinzufügen", command=self.add_files).pack(side="left", padx=5)
             ttk.Button(btn_frame, text="Ordner hinzufügen", command=self.add_folder).pack(side="left", padx=5)
+            ttk.Button(btn_frame, text="Ausgewählte entfernen", command=self.remove_selected_files).pack(side="left", padx=5)
             ttk.Button(btn_frame, text="Liste leeren", command=self.clear_list).pack(side="left", padx=5)
 
             # Listbox für Dateipfade
@@ -1681,6 +1682,8 @@ if GUI_AVAILABLE:
 
             self.file_listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED)
             self.file_listbox.pack(side="left", fill="both", expand=True)
+            # Markierte Einträge lassen sich zusätzlich über die Entf-Taste entfernen.
+            self.file_listbox.bind("<Delete>", self.remove_selected_files)
 
             scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.file_listbox.yview)
             scrollbar.pack(side="right", fill="y")
@@ -1797,6 +1800,13 @@ if GUI_AVAILABLE:
                 for f in collected:
                     if f not in self.file_listbox.get(0, tk.END):
                         self.file_listbox.insert(tk.END, f)
+
+        def remove_selected_files(self, event=None):
+            """Entfernt die markierten Einträge aus der Dateiliste, ohne Dateien zu löschen."""
+            selected_indices = self.file_listbox.curselection()
+            for index in reversed(selected_indices):
+                self.file_listbox.delete(index)
+            return "break"
 
         def clear_list(self):
             self.file_listbox.delete(0, tk.END)
