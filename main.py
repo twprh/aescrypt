@@ -1680,17 +1680,15 @@ if GUI_AVAILABLE:
             list_frame.pack(fill="x", expand=False)
             list_frame.pack_propagate(False)
 
-            # Eigene, plattformübergreifende Auswahlsteuerung für Windows und Linux.
-            # exportselection=False verhindert insbesondere unter Linux/X11, dass
-            # die Markierung beim Wechsel des Fokus auf ein anderes Widget verloren geht.
+            # Tkinter-Standardauswahl verwenden: EXTENDED unterstützt unter
+            # Windows und Linux Einzelklick, Strg+Klick und Umschalt+Klick nativ.
+            # exportselection=False erhält die Markierung auch bei Fokuswechseln.
             self.file_listbox = tk.Listbox(
                 list_frame,
                 selectmode=tk.EXTENDED,
                 exportselection=False,
             )
             self.file_listbox.pack(side="left", fill="both", expand=True)
-            self._file_selection_anchor = None
-            self.file_listbox.bind("<Button-1>", self.on_file_list_click)
             # Markierte Einträge lassen sich zusätzlich über die Entf-Taste entfernen.
             self.file_listbox.bind("<Delete>", self.remove_selected_files)
 
@@ -1810,55 +1808,11 @@ if GUI_AVAILABLE:
                     if f not in self.file_listbox.get(0, tk.END):
                         self.file_listbox.insert(tk.END, f)
 
-        def on_file_list_click(self, event):
-            """Verarbeitet Einzel-, Strg- und Umschalt-Klick unter Windows und Linux."""
-            listbox = self.file_listbox
-            index = listbox.nearest(event.y)
-            if index < 0 or not listbox.size():
-                return "break"
-
-            # Tk verwendet auf Windows und Linux dieselben State-Bits:
-            # Shift = 0x0001, Control = 0x0004.
-            shift_pressed = bool(event.state & 0x0001)
-            control_pressed = bool(event.state & 0x0004)
-
-            listbox.focus_set()
-            if shift_pressed:
-                anchor = self._file_selection_anchor
-                if anchor is None:
-                    anchor = index
-                if not control_pressed:
-                    listbox.selection_clear(0, tk.END)
-                first, last = sorted((anchor, index))
-                listbox.selection_set(first, last)
-                listbox.selection_anchor(anchor)
-            elif control_pressed:
-                if index in listbox.curselection():
-                    listbox.selection_clear(index)
-                else:
-                    listbox.selection_set(index)
-                self._file_selection_anchor = index
-                listbox.selection_anchor(index)
-            else:
-                listbox.selection_clear(0, tk.END)
-                listbox.selection_set(index)
-                self._file_selection_anchor = index
-                listbox.selection_anchor(index)
-
-            listbox.activate(index)
-            return "break"
-
         def remove_selected_files(self, event=None):
-            """Entfernt die markierten Einträge aus der Dateiliste, ohne Dateien zu löschen."""
+            """Entfernt markierte Listeneinträge, nicht die Dateien auf dem Datenträger."""
             selected_indices = self.file_listbox.curselection()
             for index in reversed(selected_indices):
                 self.file_listbox.delete(index)
-            if not self.file_listbox.size():
-                self._file_selection_anchor = None
-            elif self._file_selection_anchor is not None:
-                self._file_selection_anchor = min(
-                    self._file_selection_anchor, self.file_listbox.size() - 1
-                )
             return "break"
 
         def clear_list(self):
