@@ -41,16 +41,6 @@ Das ist eine der saubersten Python-F crypto-Implementierungen, die man in dieser
 
 ---
 
-## Was den Sprung auf 1⁺ fehlen würde
-
-1. Aufräumlance für verwaiste `.aescrypto-*.tmp` beim Start + Dokumentation der Plaintext-Snapshot-Phase.
-2. Windows-reservierte Namen filtern (`CON`, `NUL`, …).
-3. Passwort-Bestätigungsfeld + NFKC-Normalisierung.
-4. Optionales Secure-Delete mit ehrlicher Einordnung (oder Checkbox-Label „in Papierkorb-Sinn entfernen").
-5. Key-Commitment-Wert im Format v3.
-
----
-
 ## Fazit
 
 **1⁻.** Die kryptografischen Grundlagen (Modi, KDF, Nonces, AAD, Auth-before-Publish) sind fehlerfrei und besser als viele etablierte Tools. Fast alle klassischen Anfängerfehler (ECB, statische Nonces, unauthentifizierte Header, `eval`, Path Traversal, TOCTOU-Blindheit) fehlen vollständig – erkennbar ist hier bewusst gearbeitet worden, nicht nur „verschlüsselt". Die Abzüge betreffen Operational Security am Rand (Restdaten, Secure Delete, GUI-Hygiene) und Plattform-Randfälle, nicht die Kernsicherheit des Entwurfs.
