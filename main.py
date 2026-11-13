@@ -13,6 +13,7 @@ import tempfile
 import base64
 import ctypes
 import errno
+import stat
 
 
 try:
@@ -68,7 +69,7 @@ FORMAT_VERSION_V3 = 1
 # Version 2 des AESCRYPT3-Headers: KDF-Parameter liegen im Header.
 FORMAT_VERSION_V3_KDF = 2
 
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.4"
 
 SALT_SIZE = 16
 NONCE_SIZE = 12
@@ -628,7 +629,7 @@ def decrypt_text(encoded_payload: str, password: str) -> str:
 def _sha256_file(path):
     """Berechnet SHA-256 blockweise, ohne die Datei vollständig in den RAM zu laden."""
     digest = hashlib.sha256()
-    with open(path, "rb") as stream:
+    with _open_regular_input(path) as stream:
         while True:
             block = stream.read(CHUNK_SIZE)
             if not block:
@@ -637,10 +638,116 @@ def _sha256_file(path):
     return digest.digest()
 
 
-def _copy_source_snapshot(input_path, snapshot_fd):
-    """Kopiert die Quelle in den exklusiv angelegten Snapshot-Dateideskriptor."""
+def _open_regular_input(path):
+    """Öffnet eine reguläre Quelldatei ohne Symlink-/Reparse-Point-Folgezugriff.
+
+    POSIX: O_NOFOLLOW verhindert, dass der letzte Pfadbestandteil zwischen
+    Prüfung und Öffnen durch einen Symlink ersetzt werden kann.
+    Windows: CreateFileW mit FILE_FLAG_OPEN_REPARSE_POINT öffnet den
+    Reparse-Point selbst; dessen Attribute werden am Handle geprüft, bevor
+    daraus ein Python-Dateistream erzeugt wird.
+    """
+    path = os.path.abspath(os.fspath(path))
+
+    if os.name == "nt":
+        import msvcrt
+        from ctypes import wintypes
+
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        FILE_SHARE_DELETE = 0x00000004
+        OPEN_EXISTING = 3
+        FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+        FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
+        FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+        FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+        FILE_ATTRIBUTE_TAG_INFO_CLASS = 9  # FileAttributeTagInfo
+
+        class FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
+            _fields_ = [("FileAttributes", wintypes.DWORD),
+                        ("ReparseTag", wintypes.DWORD)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                wintypes.HANDLE]
+        create_file.restype = wintypes.HANDLE
+        get_info = kernel32.GetFileInformationByHandleEx
+        get_info.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID,
+                             wintypes.DWORD]
+        get_info.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_file(
+            path, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if handle == invalid_handle:
+            error = ctypes.get_last_error()
+            raise OSError(error, "Quelldatei konnte nicht sicher geöffnet werden", path)
+
+        try:
+            info = FILE_ATTRIBUTE_TAG_INFO()
+            if not get_info(handle, FILE_ATTRIBUTE_TAG_INFO_CLASS,
+                            ctypes.byref(info), ctypes.sizeof(info)):
+                error = ctypes.get_last_error()
+                raise OSError(error, "Dateiattribute konnten nicht geprüft werden", path)
+            if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT:
+                raise ValueError("Symbolische Links und Reparse-Points werden aus Sicherheitsgründen nicht verarbeitet.")
+            if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY:
+                raise ValueError("Die Quelle ist keine reguläre Datei.")
+
+            # open_osfhandle übernimmt den Windows-Handle. Danach schließt
+            # fdopen ihn regulär; der Handle wird nicht doppelt geschlossen.
+            fd = msvcrt.open_osfhandle(int(handle), os.O_RDONLY | os.O_BINARY)
+            handle = None
+            stream = os.fdopen(fd, "rb")
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                stream.close()
+                raise ValueError("Die Quelle ist keine reguläre Datei.")
+            return stream
+        finally:
+            if handle is not None:
+                close_handle(handle)
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is not None:
+        flags |= nofollow
+    else:
+        # Auf den unterstützten POSIX-Zielsystemen ist O_NOFOLLOW üblich.
+        # Fehlt es, wird vor und nach dem Öffnen geprüft; die Prüfung kann
+        # den atomaren Schutz von O_NOFOLLOW dann allerdings nicht ersetzen.
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            raise ValueError("Symbolische Links werden aus Sicherheitsgründen nicht verarbeitet.")
+
+    fd = os.open(path, flags)
+    try:
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ValueError("Die Quelle ist keine reguläre Datei.")
+        if nofollow is None:
+            current_stat = os.lstat(path)
+            if stat.S_ISLNK(current_stat.st_mode) or (opened_stat.st_dev, opened_stat.st_ino) != (current_stat.st_dev, current_stat.st_ino):
+                raise ValueError("Die Quelldatei wurde während des Öffnens verändert.")
+        return os.fdopen(fd, "rb")
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _copy_source_snapshot(input_path, snapshot):
+    """Kopiert die Quelle in einen privaten, automatisch bereinigten Temp-Stream."""
     digest = hashlib.sha256()
-    with open(input_path, "rb") as source, os.fdopen(snapshot_fd, "wb") as snapshot:
+    with _open_regular_input(input_path) as source:
         while True:
             block = source.read(CHUNK_SIZE)
             if not block:
@@ -669,20 +776,20 @@ def encrypt_file(input_path, output_path, password, progress_cb=None):
     out_dir = os.path.dirname(output_path) or "."
     os.makedirs(out_dir, exist_ok=True)
 
-    snapshot_fd, snapshot_path = tempfile.mkstemp(
-        dir=out_dir, prefix=".aescrypto-snapshot-", suffix=".tmp"
-    )
+    # TemporaryFile wird unter POSIX nach Möglichkeit sofort entkoppelt und
+    # unter Windows beim Schließen entfernt. Bei Prozessabbruch bleibt dadurch
+    # kein benannter Klartext-Snapshot im Zielordner zurück.
+    snapshot = tempfile.TemporaryFile(mode="w+b", dir=out_dir)
     tmp_fd = None
     tmp_path = None
 
     try:
-        # Erst eine private Momentaufnahme erzeugen. Änderungen der Quelle
-        # während des Kopierens werden durch den anschließenden Hashvergleich
-        # erkannt, sofern sie nicht exakt auf denselben Dateiinhalt zurücklaufen.
-        snapshot_fd_for_copy = snapshot_fd
-        snapshot_fd = None  # _copy_source_snapshot schließt den Deskriptor auch bei Fehlern.
-        snapshot_digest = _copy_source_snapshot(input_path, snapshot_fd_for_copy)
-        file_size = os.path.getsize(snapshot_path)
+        # Änderungen der Quelle während des Kopierens werden durch den
+        # anschließenden Hashvergleich erkannt.
+        snapshot_digest = _copy_source_snapshot(input_path, snapshot)
+        snapshot.seek(0, os.SEEK_END)
+        file_size = snapshot.tell()
+        snapshot.seek(0)
         if _sha256_file(input_path) != snapshot_digest:
             raise ValueError(
                 "Quelldatei wurde während der Momentaufnahme verändert; "
@@ -710,30 +817,30 @@ def encrypt_file(input_path, output_path, password, progress_cb=None):
             dir=out_dir, prefix=".aescrypto-", suffix=".tmp"
         )
 
-        with open(snapshot_path, "rb") as fin:
-            with os.fdopen(tmp_fd, "wb") as fout:
-                tmp_fd = None
-                fout.write(header)
-                write_v3_chunk(fout, aes_key, base_nonce, header, 0, metadata)
+        snapshot.seek(0)
+        with os.fdopen(tmp_fd, "wb") as fout:
+            tmp_fd = None
+            fout.write(header)
+            write_v3_chunk(fout, aes_key, base_nonce, header, 0, metadata)
 
-                bytes_read = 0
-                for index in range(1, data_chunk_count + 1):
-                    expected = min(CHUNK_SIZE, file_size - bytes_read)
-                    chunk = fin.read(expected)
-                    if len(chunk) != expected:
-                        raise ValueError("Interne Momentaufnahme ist unvollständig.")
-                    write_v3_chunk(fout, aes_key, base_nonce, header, index, chunk)
-                    bytes_read += len(chunk)
-                    if progress_cb:
-                        should_stop = progress_cb(bytes_read, file_size)
-                        if should_stop is False:
-                            raise InterruptedError("Verarbeitung vom Benutzer gestoppt.")
+            bytes_read = 0
+            for index in range(1, data_chunk_count + 1):
+                expected = min(CHUNK_SIZE, file_size - bytes_read)
+                chunk = snapshot.read(expected)
+                if len(chunk) != expected:
+                    raise ValueError("Interne Momentaufnahme ist unvollständig.")
+                write_v3_chunk(fout, aes_key, base_nonce, header, index, chunk)
+                bytes_read += len(chunk)
+                if progress_cb:
+                    should_stop = progress_cb(bytes_read, file_size)
+                    if should_stop is False:
+                        raise InterruptedError("Verarbeitung vom Benutzer gestoppt.")
 
-                if bytes_read != file_size or fin.read(1):
-                    raise ValueError("Interne Momentaufnahme hat eine unerwartete Größe.")
+            if bytes_read != file_size or snapshot.read(1):
+                raise ValueError("Interne Momentaufnahme hat eine unerwartete Größe.")
 
-                fout.flush()
-                os.fsync(fout.fileno())
+            fout.flush()
+            os.fsync(fout.fileno())
 
         # Prüft auch Änderungen, die während der eigentlichen Verschlüsselung
         # an der Originalquelle vorgenommen wurden. Vor erfolgreicher Prüfung
@@ -760,15 +867,7 @@ def encrypt_file(input_path, output_path, password, progress_cb=None):
                 pass
         raise
     finally:
-        if snapshot_fd is not None:
-            try:
-                os.close(snapshot_fd)
-            except OSError:
-                pass
-        try:
-            os.unlink(snapshot_path)
-        except OSError:
-            pass
+        snapshot.close()
 
 def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
     input_path = os.path.abspath(input_path)
@@ -780,7 +879,7 @@ def decrypt_file_v3(input_path, output_path, password, progress_cb=None):
     fsize = os.path.getsize(input_path)
     tmp_path = None
 
-    with open(input_path, "rb") as fin:
+    with _open_regular_input(input_path) as fin:
         (
             salt,
             base_nonce,
@@ -920,7 +1019,7 @@ def decrypt_file_v2(input_path, output_path, password, progress_cb=None):
     tmp_path = None
     tmp_fd = None
     try:
-        with open(input_path, "rb") as fin:
+        with _open_regular_input(input_path) as fin:
             salt, nonce, header = read_header(fin)
 
             fin.seek(fsize - TAG_SIZE)
@@ -1030,7 +1129,7 @@ def decrypt_file_v2(input_path, output_path, password, progress_cb=None):
 def decrypt_file(input_path, output_path, password, progress_cb=None):
     """Automatische Format-Erkennung; AESCRYPT2 bleibt abwärtskompatibel."""
     input_path = os.path.abspath(input_path)
-    with open(input_path, "rb") as fin:
+    with _open_regular_input(input_path) as fin:
         magic = fin.read(len(MAGIC_V3))
 
     if magic == MAGIC_V3:
@@ -1044,11 +1143,11 @@ def decrypt_file(input_path, output_path, password, progress_cb=None):
 
 def get_original_filename(enc_path, password):
     enc_path = os.path.abspath(enc_path)
-    with open(enc_path, "rb") as fin:
+    with _open_regular_input(enc_path) as fin:
         magic = fin.read(len(MAGIC_V3))
 
     if magic == MAGIC_V3:
-        with open(enc_path, "rb") as fin:
+        with _open_regular_input(enc_path) as fin:
             (
                 salt,
                 base_nonce,
@@ -1092,7 +1191,7 @@ def get_original_filename(enc_path, password):
         if fsize < header_size + NAME_LEN_SIZE + 1 + TAG_SIZE:
             raise ValueError("Datei zu klein oder beschädigt.")
 
-        with open(enc_path, "rb") as fin:
+        with _open_regular_input(enc_path) as fin:
             salt, nonce, header = read_header(fin)
             fin.seek(fsize - TAG_SIZE)
             tag = fin.read(TAG_SIZE)
@@ -1491,6 +1590,7 @@ if GUI_AVAILABLE:
             self.tray_icon = None
             self.tray_thread = None
             self.exiting = False
+            self.worker_thread = None
 
             # Fenster-Icon
             try:
@@ -1644,13 +1744,43 @@ if GUI_AVAILABLE:
                 return
 
             self.exiting = True
+            if getattr(self, "processing", False):
+                # Verarbeitung sauber abbrechen und auf das Ende des Workers
+                # warten. Ein laufender Schreibvorgang wird nicht hart beendet.
+                self.stop_event.set()
+                try:
+                    self.progress_status_var.set("Beenden – Verarbeitung wird sicher gestoppt ...")
+                except Exception:
+                    pass
+                self.root.after(100, self._wait_for_worker_and_exit)
+                return
+
+            self._destroy_application()
+
+        def _wait_for_worker_and_exit(self):
+            worker = self.worker_thread
+            if worker is not None and worker.is_alive():
+                self.root.after(100, self._wait_for_worker_and_exit)
+                return
+            self._destroy_application()
+
+        def _destroy_application(self):
+            # Passwörter bleiben während der laufenden Sitzung in den
+            # Eingabefeldern erhalten, werden beim tatsächlichen Beenden aber
+            # aus den Widgets entfernt. Es findet keine Speicherung auf Platte statt.
+            for entry_name in ("file_pwd_entry", "text_pwd_entry"):
+                try:
+                    entry = getattr(self, entry_name, None)
+                    if entry is not None:
+                        entry.delete(0, tk.END)
+                except Exception:
+                    pass
 
             try:
                 if self.tray_icon is not None:
                     self.tray_icon.stop()
             except Exception:
                 pass
-
             try:
                 self.root.destroy()
             except Exception:
@@ -1843,13 +1973,13 @@ if GUI_AVAILABLE:
             delete_original = self.del_orig_var.get()
             encrypt_filename = self.enc_name_var.get()
 
-            worker = threading.Thread(
+            self.worker_thread = threading.Thread(
                 target=self._process_files_worker,
                 args=(paths, pwd, delete_original, encrypt_filename),
                 name="AESCryptoFileWorker",
-                daemon=True,
+                daemon=False,
             )
-            worker.start()
+            self.worker_thread.start()
 
         def _process_files_worker(self, paths, password, delete_original, encrypt_filename):
             success_count = 0
@@ -1942,6 +2072,9 @@ if GUI_AVAILABLE:
 
         def _processing_finished(self, success_count, error_msgs, cancelled=False):
             self.processing = False
+            # Das Datei-Passwort bleibt absichtlich während der gesamten
+            # Programmsitzung im Eingabefeld, damit mehrere Jobs ohne erneute
+            # Eingabe verarbeitet werden können. Gelöscht wird es erst beim Beenden.
             self.progress_bar["value"] = 0
             self.progress_percent_var.set("0 %")
             self.progress_status_var.set("Bereit")
@@ -1950,6 +2083,9 @@ if GUI_AVAILABLE:
                 self.processing_button.config(text="Verarbeitung starten", state="normal")
             except Exception:
                 pass
+
+            if self.exiting:
+                return
 
             if cancelled:
                 messagebox.showinfo(
@@ -2063,11 +2199,32 @@ if GUI_AVAILABLE:
             if result_text:
                 self.root.clipboard_clear()
                 self.root.clipboard_append(result_text)
-                messagebox.showinfo("Erfolg", "Ergebnis wurde in die Zwischenablage kopiert.")
+                # Nach 60 Sekunden nur dann leeren, wenn der Inhalt seitdem
+                # nicht durch den Benutzer ersetzt wurde (Windows/Linux/Tk).
+                self.root.after(60000, self._clear_clipboard_if_unchanged, result_text)
+                messagebox.showinfo(
+                    "Erfolg",
+                    "Ergebnis kopiert. Die Zwischenablage wird nach 60 Sekunden "
+                    "geleert, sofern sie bis dahin unverändert bleibt."
+                )
             else:
                 messagebox.showwarning("Warnung", "Kein Text zum Kopieren vorhanden.")
 
+        def _clear_clipboard_if_unchanged(self, copied_text):
+            try:
+                if self.root.clipboard_get() == copied_text:
+                    self.root.clipboard_clear()
+            except Exception:
+                # Clipboard nicht verfügbar oder Inhalt bereits ersetzt.
+                pass
+
         def clear_text_fields(self):
+            current_output = self.output_text_area.get("1.0", tk.END).strip()
+            try:
+                if current_output and self.root.clipboard_get() == current_output:
+                    self.root.clipboard_clear()
+            except Exception:
+                pass
             self.text_pwd_entry.delete(0, tk.END)
             self.input_text_area.delete("1.0", tk.END)
             self.output_text_area.delete("1.0", tk.END)
